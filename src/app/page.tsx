@@ -13,13 +13,27 @@ interface TeamMember {
   is_online?: number;
 }
 
+interface AttendanceRecord {
+  id: number;
+  worker_id: string;
+  worker_name?: string;
+  designations?: string;
+  date: string;
+  clock_in: string;
+  clock_out: string | null;
+  status: string;
+  regular_hours?: string | number;
+  overtime_hours?: string | number;
+  created_at?: string;
+}
+
 export default function Home() {
   const [isLoginOpen, setIsLoginOpen] = useState(false);
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
   const [isScopeOpen, setIsScopeOpen] = useState(false);
   const [userRole, setUserRole] = useState<UserRole>(null);
   const [loginInput, setLoginInput] = useState('');
-  const [attendanceLogs, setAttendanceLogs] = useState([]);
+  const [attendanceLogs, setAttendanceLogs] = useState<AttendanceRecord[]>([]);
   const [userData, setUserData] = useState<{ full_name: string; designation?: string; id?: number } | null>(null);
 
   const printingRef = useRef<HTMLDivElement>(null);
@@ -55,18 +69,31 @@ export default function Home() {
       .catch(err => console.error('Error fetching team members:', err));
   };
 
+  const fetchAttendance = () => {
+    fetch('/api/attendance/list')
+      .then(res => res.json())
+      .then(data => {
+        if (Array.isArray(data)) setAttendanceLogs(data);
+      })
+      .catch(err => console.error('Error fetching attendance:', err));
+  };
+
+  // ADMIN DATA FETCHING & 15-SECOND LIVE POLLING
   useEffect(() => {
     if (userRole === 'admin') {
-      fetch('/api/attendance/list')
-        .then(res => res.json())
-        .then(data => setAttendanceLogs(data));
+      fetchAttendance();
+      fetchTeamMembers();
+
       fetch('/api/admin/payroll')
         .then(res => res.json())
         .then(data => setPayroll(data));  
       fetch('/api/projects/list')
         .then(res => res.json())
         .then(data => setProjectBriefs(data));
-      fetchTeamMembers();
+
+      // Auto-poll attendance every 15 seconds to reflect kiosk taps live
+      const interval = setInterval(fetchAttendance, 15000);
+      return () => clearInterval(interval);
     }
   }, [userRole]);
 
@@ -246,7 +273,7 @@ export default function Home() {
             <a 
               href="/kiosk" 
               target="_blank" 
-              className="bg-orange-50 text-[#FF6600] border border-orange-200 px-4 py-2 rounded-full font-bold text-xs uppercase hover:bg-[#FF6600] hover:text-white transition-all"
+              className="bg-orange-50 text-[#FF6600] border border-orange-200 px-4 py-2 rounded-full font-bold text-xs uppercase hover:bg-[#FF6600] hover:text-white transition-all shadow-sm"
             >
               Open Kiosk ⤢
             </a>
@@ -266,8 +293,10 @@ export default function Home() {
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm">
                 <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Active Today</p>
-                <p className="text-3xl font-black">
-                  {Array.isArray(attendanceLogs) ? attendanceLogs.filter((log: any) => !log.check_out).length : 0}
+                <p className="text-3xl font-black text-green-600">
+                  {Array.isArray(attendanceLogs) 
+                    ? attendanceLogs.filter((log) => !log.clock_out).length 
+                    : 0}
                 </p>
               </div>
               <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm">
@@ -276,14 +305,88 @@ export default function Home() {
               </div>
               <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm">
                 <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Total OT Hours</p>
-                <p className="text-3xl font-black text-green-600">
+                <p className="text-3xl font-black text-[#1a1a1a]">
                   {Array.isArray(attendanceLogs) 
-                    ? attendanceLogs.reduce((acc, log: any) => acc + parseFloat(log.overtime_hrs || 0), 0).toFixed(1) 
+                    ? attendanceLogs.reduce((acc, log) => acc + parseFloat(String(log.overtime_hours || 0)), 0).toFixed(1) 
                     : "0.0"}h
                 </p>
               </div>
               <div className="bg-[#1a1a1a] p-6 rounded-3xl shadow-xl flex items-center justify-center">
-                <span className="text-white text-[10px] font-black uppercase tracking-[0.3em]">DB Sync Live</span>
+                <span className="text-white text-[10px] font-black uppercase tracking-[0.3em] flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-green-500 animate-ping"></span>
+                  DB Sync Live
+                </span>
+              </div>
+            </div>
+
+            {/* LIVE ATTENDANCE LOGS TABLE */}
+            <div className="bg-white p-6 md:p-10 rounded-[40px] shadow-sm border border-slate-100">
+              <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-2">
+                <div>
+                  <h2 className="text-2xl md:text-3xl font-black tracking-tighter text-[#1a1a1a]">Live Attendance Punches</h2>
+                  <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mt-1">Real-time NFC card scans and shifts</p>
+                </div>
+                <button 
+                  onClick={fetchAttendance}
+                  className="bg-slate-100 text-[#1a1a1a] px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider hover:bg-[#FF6600] hover:text-white transition-all flex items-center gap-1.5"
+                >
+                  Refresh Logs ⟳
+                </button>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse min-w-[750px]">
+                  <thead>
+                    <tr className="text-slate-400 text-[10px] uppercase tracking-[0.2em] border-b border-slate-100">
+                      <th className="pb-3 pl-2">Employee</th>
+                      <th className="pb-3">Date</th>
+                      <th className="pb-3">Clock In</th>
+                      <th className="pb-3">Clock Out</th>
+                      <th className="pb-3">Duration</th>
+                      <th className="pb-3 text-right pr-2">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="text-sm font-semibold">
+                    {Array.isArray(attendanceLogs) && attendanceLogs.length > 0 ? (
+                      attendanceLogs.map((log) => (
+                        <tr key={log.id} className="border-b border-slate-50 hover:bg-slate-50/60 transition-colors">
+                          <td className="py-4 pl-2 font-bold text-[#1a1a1a]">
+                            {log.worker_name || log.worker_id}
+                            <span className="block text-[9px] text-slate-400 font-mono">ID: #{log.worker_id}</span>
+                          </td>
+                          <td className="py-4 text-xs font-mono text-slate-600">{log.date}</td>
+                          <td className="py-4 font-mono text-xs text-green-600 font-bold">{log.clock_in}</td>
+                          <td className="py-4 font-mono text-xs text-blue-600 font-bold">{log.clock_out || '—'}</td>
+                          <td className="py-4 font-mono text-xs text-slate-600">
+                            {log.clock_out ? (
+                              `${(parseFloat(String(log.regular_hours || 0)) + parseFloat(String(log.overtime_hours || 0))).toFixed(1)}h`
+                            ) : (
+                              <span className="text-[#FF6600] font-bold animate-pulse">In Progress...</span>
+                            )}
+                          </td>
+                          <td className="py-4 pr-2 text-right">
+                            {!log.clock_out ? (
+                              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-green-50 text-green-700 border border-green-200">
+                                <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+                                Clocked In
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-slate-100 text-slate-500">
+                                Completed
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      ))
+                    ) : (
+                      <tr>
+                        <td colSpan={6} className="py-8 text-center text-slate-400 italic text-xs">
+                          No attendance logs found for today.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
               </div>
             </div>
 
