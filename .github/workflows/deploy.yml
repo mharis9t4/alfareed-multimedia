@@ -39,7 +39,7 @@ jobs:
           port: 21
           timeout: 90000
           # Cleans old files to ensure the new .next build is fresh
-          dangerous-clean-slate: true 
+          dangerous-clean-slate: false 
           exclude: |
             **/.git*
             **/.github*
