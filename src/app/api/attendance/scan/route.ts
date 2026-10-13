@@ -5,7 +5,6 @@ export async function POST(req: Request) {
   try {
     const { cardId } = await req.json();
 
-    // 1. Sanitize card input
     const cleanCardId = String(cardId || '').trim();
     if (!cleanCardId) {
       return NextResponse.json(
@@ -14,7 +13,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 2. Find the employee associated with this card
+    // 1. Identify employee by registered card ID
     const [userRows]: any = await db.execute(
       'SELECT id, user_id, full_name, role, hourly_rate FROM users WHERE card_id = ? LIMIT 1',
       [cleanCardId]
@@ -34,11 +33,11 @@ export async function POST(req: Request) {
     const employee = userRows[0];
     const workerId = employee.user_id;
 
-    // 3. Compute accurate local date and time for Karachi (PKT / UTC+5)
+    // 2. Generate current Karachi date & time (PKT / UTC+5)
     const now = new Date();
     const currentDate = new Intl.DateTimeFormat('en-CA', { 
       timeZone: 'Asia/Karachi' 
-    }).format(now); // Output: YYYY-MM-DD
+    }).format(now); // Format: YYYY-MM-DD
 
     const currentTime = new Intl.DateTimeFormat('en-GB', { 
       timeZone: 'Asia/Karachi', 
@@ -46,9 +45,9 @@ export async function POST(req: Request) {
       hour: '2-digit', 
       minute: '2-digit', 
       second: '2-digit' 
-    }).format(now); // Output: HH:MM:SS
+    }).format(now); // Format: HH:MM:SS
 
-    // 4. Check if employee has an open attendance record today (clocked in, but not clocked out)
+    // 3. Check for an active shift today without a clock_out
     const [attendanceRows]: any = await db.execute(
       'SELECT * FROM attendance WHERE worker_id = ? AND date = ? AND clock_out IS NULL ORDER BY id DESC LIMIT 1',
       [workerId, currentDate]
@@ -59,7 +58,6 @@ export async function POST(req: Request) {
       const activeRecord = attendanceRows[0];
       const clockInTime = activeRecord.clock_in;
 
-      // Calculate elapsed hours between clock_in and clock_out
       const inParts = clockInTime.split(':').map(Number);
       const outParts = currentTime.split(':').map(Number);
 
@@ -69,7 +67,6 @@ export async function POST(req: Request) {
       const diffSeconds = Math.max(0, outSeconds - inSeconds);
       const totalHours = Number((diffSeconds / 3600).toFixed(2));
       
-      // Standard 8-hour shift calculation
       const regularHours = Math.min(totalHours, 8);
       const overtimeHours = Number(Math.max(0, totalHours - regularHours).toFixed(2));
 
@@ -90,7 +87,9 @@ export async function POST(req: Request) {
         time: currentTime,
         date: currentDate,
         totalHours,
-        message: `Goodbye, ${employee.full_name}! Clock-out recorded.`
+        regularHours,
+        overtimeHours,
+        message: `Goodbye, ${employee.full_name}! Shift completed.`
       });
 
     } else {
@@ -111,7 +110,7 @@ export async function POST(req: Request) {
         time: currentTime,
         date: currentDate,
         attendanceId: insertResult.insertId,
-        message: `Welcome, ${employee.full_name}! Clock-in recorded.`
+        message: `Welcome, ${employee.full_name}! Shift started.`
       });
     }
 
