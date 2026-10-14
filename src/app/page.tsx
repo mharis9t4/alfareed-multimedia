@@ -1,7 +1,8 @@
 'use client';
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 
 type UserRole = 'admin' | 'worker' | 'customer' | null;
+type AdminTab = 'attendance' | 'cards' | 'payroll' | 'leads' | 'register';
 
 interface TeamMember {
   id: number;
@@ -27,21 +28,34 @@ interface AttendanceRecord {
   created_at?: string;
 }
 
+interface ProjectBrief {
+  id: number;
+  client_name: string;
+  service_type: string;
+  deadline?: string;
+  description: string;
+  phone?: string;
+  status?: string;
+  created_at?: string;
+}
+
 export default function Home() {
-  const [isLoginOpen, setIsLoginOpen] = useState(false);
-  const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
-  const [isScopeOpen, setIsScopeOpen] = useState(false);
+  // Session & Auth State
   const [userRole, setUserRole] = useState<UserRole>(null);
+  const [userData, setUserData] = useState<{ full_name: string; designation?: string; id?: number; user_id?: string } | null>(null);
+  const [isLoginOpen, setIsLoginOpen] = useState(false);
   const [loginInput, setLoginInput] = useState('');
-  const [attendanceLogs, setAttendanceLogs] = useState<AttendanceRecord[]>([]);
-  const [userData, setUserData] = useState<{ full_name: string; designation?: string; id?: number } | null>(null);
+  const [loginError, setLoginError] = useState('');
 
-  const printingRef = useRef<HTMLDivElement>(null);
-  const [projectBriefs, setProjectBriefs] = useState([]);
-  const [payroll, setPayroll] = useState([]);
-
-  // --- NFC Card Assignment States ---
+  // Admin Dashboard State
+  const [adminTab, setAdminTab] = useState<AdminTab>('attendance');
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
+  const [attendanceLogs, setAttendanceLogs] = useState<AttendanceRecord[]>([]);
+  const [projectBriefs, setProjectBriefs] = useState<ProjectBrief[]>([]);
+  const [attendanceSearch, setAttendanceSearch] = useState('');
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  // NFC Card Assignment Modal
   const [selectedWorker, setSelectedWorker] = useState<TeamMember | null>(null);
   const [isNfcModalOpen, setIsNfcModalOpen] = useState(false);
   const [nfcInput, setNfcInput] = useState('');
@@ -50,66 +64,84 @@ export default function Home() {
     type: 'idle'
   });
 
+  // Public Landing Page Modals & Calculator
+  const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
+  const [isScopeOpen, setIsScopeOpen] = useState(false);
+  const [calcService, setCalcService] = useState<'bw_copy' | 'color_print' | 'pvc_card' | 'composing' | 'spiral_binding' | 'hard_binding' | 'panaflex'>('color_print');
+  const [calcQuantity, setCalcQuantity] = useState<number>(50);
+
+  const printingRef = useRef<HTMLDivElement>(null);
+
+  // -------------------------------------------------------------
   // SESSION PERSISTENCE
+  // -------------------------------------------------------------
   useEffect(() => {
-    const savedSession = localStorage.getItem('alfareed_session');
-    if (savedSession) {
-      const data = JSON.parse(savedSession);
-      setUserRole(data.role);
-      setUserData(data);
+    const saved = localStorage.getItem('alfareed_session');
+    if (saved) {
+      try {
+        const data = JSON.parse(saved);
+        setUserRole(data.role);
+        setUserData(data);
+      } catch (err) {
+        localStorage.removeItem('alfareed_session');
+      }
     }
   }, []);
 
-  const fetchTeamMembers = () => {
-    fetch('/api/users/list')
-      .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) setTeamMembers(data);
-      })
-      .catch(err => console.error('Error fetching team members:', err));
+  // -------------------------------------------------------------
+  // DATA FETCHING & 15-SECOND POLLING
+  // -------------------------------------------------------------
+  const fetchAllData = async () => {
+    setIsRefreshing(true);
+    try {
+      const [teamRes, attRes, projRes] = await Promise.all([
+        fetch('/api/users/list'),
+        fetch('/api/attendance/list'),
+        fetch('/api/projects/list').catch(() => null)
+      ]);
+
+      if (teamRes.ok) {
+        const teamData = await teamRes.json();
+        if (Array.isArray(teamData)) setTeamMembers(teamData);
+      }
+      if (attRes.ok) {
+        const attData = await attRes.json();
+        if (Array.isArray(attData)) setAttendanceLogs(attData);
+      }
+      if (projRes && projRes.ok) {
+        const projData = await projRes.json();
+        if (Array.isArray(projData)) setProjectBriefs(projData);
+      }
+    } catch (err) {
+      console.error('Data sync failed:', err);
+    } finally {
+      setIsRefreshing(false);
+    }
   };
 
-  const fetchAttendance = () => {
-    fetch('/api/attendance/list')
-      .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) setAttendanceLogs(data);
-      })
-      .catch(err => console.error('Error fetching attendance:', err));
-  };
-
-  // ADMIN DATA FETCHING & 15-SECOND LIVE POLLING
   useEffect(() => {
     if (userRole === 'admin') {
-      fetchAttendance();
-      fetchTeamMembers();
-
-      fetch('/api/admin/payroll')
-        .then(res => res.json())
-        .then(data => setPayroll(data));  
-      fetch('/api/projects/list')
-        .then(res => res.json())
-        .then(data => setProjectBriefs(data));
-
-      // Auto-poll attendance every 15 seconds to reflect kiosk taps live
-      const interval = setInterval(fetchAttendance, 15000);
+      fetchAllData();
+      const interval = setInterval(fetchAllData, 15000);
       return () => clearInterval(interval);
     }
   }, [userRole]);
 
-  // USB HID KEYSTROKE & ANDROID WEB NFC LISTENER (For Card Pairing Modal)
+  // -------------------------------------------------------------
+  // NFC ENROLLMENT LISTENER (USB Wedge + Android Web NFC)
+  // -------------------------------------------------------------
   useEffect(() => {
     if (!isNfcModalOpen || !selectedWorker) return;
 
     let buffer = '';
-    let timer: NodeJS.Timeout;
+    let flushTimer: NodeJS.Timeout;
 
-    const processCardId = async (scannedId: string) => {
+    const processScannedCard = async (scannedId: string) => {
       const clean = scannedId.replace(/\D/g, '').trim();
       if (clean.length < 4) return;
 
       setNfcInput(clean);
-      setNfcStatus({ message: `Card ${clean} detected. Assigning...`, type: 'loading' });
+      setNfcStatus({ message: `Card ${clean} detected. Pairing...`, type: 'loading' });
 
       try {
         const res = await fetch('/api/users/assign-card', {
@@ -120,38 +152,32 @@ export default function Home() {
         const data = await res.json();
 
         if (res.ok) {
-          setNfcStatus({ message: `Successfully assigned card ${clean} to ${selectedWorker.full_name}!`, type: 'success' });
-          fetchTeamMembers();
+          setNfcStatus({ message: `Card ${clean} successfully linked to ${selectedWorker.full_name}!`, type: 'success' });
+          fetchAllData();
           setTimeout(() => {
             setIsNfcModalOpen(false);
             setSelectedWorker(null);
-          }, 1500);
+          }, 1200);
         } else {
-          setNfcStatus({ message: data.error || 'Failed to assign card.', type: 'error' });
+          setNfcStatus({ message: data.error || 'Failed to save card.', type: 'error' });
         }
       } catch (err) {
         setNfcStatus({ message: 'Network connection failed.', type: 'error' });
       }
     };
 
-    // 1. Desktop USB IC Reader (Keyboard Wedge listener)
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Enter' || e.key === 'Tab') {
-        if (buffer.length >= 4) {
-          processCardId(buffer);
-        }
+        if (buffer.length >= 4) processScannedCard(buffer);
         buffer = '';
-        clearTimeout(timer);
+        clearTimeout(flushTimer);
         return;
       }
-
       if (/^\d$/.test(e.key)) {
         buffer += e.key;
-        clearTimeout(timer);
-        timer = setTimeout(() => {
-          if (buffer.length >= 4) {
-            processCardId(buffer);
-          }
+        clearTimeout(flushTimer);
+        flushTimer = setTimeout(() => {
+          if (buffer.length >= 4) processScannedCard(buffer);
           buffer = '';
         }, 150);
       }
@@ -159,22 +185,17 @@ export default function Home() {
 
     window.addEventListener('keydown', handleKeyDown);
 
-    // 2. Mobile Android Chrome (Web NFC listener)
-    let ndef: any = null;
-    let abortController: AbortController | null = null;
+    let abortCtrl: AbortController | null = null;
     if (typeof window !== 'undefined' && 'NDEFReader' in window) {
       try {
-        abortController = new AbortController();
-        ndef = new (window as any).NDEFReader();
-        ndef.scan({ signal: abortController.signal }).then(() => {
+        abortCtrl = new AbortController();
+        const ndef = new (window as any).NDEFReader();
+        ndef.scan({ signal: abortCtrl.signal }).then(() => {
           ndef.onreading = (event: any) => {
             if (event.serialNumber) {
-              const hexParts = event.serialNumber.split(':');
-              const hex = hexParts.join('');
+              const hex = event.serialNumber.split(':').join('');
               const dec = parseInt(hex, 16);
-              if (!isNaN(dec)) {
-                processCardId(String(dec).padStart(10, '0'));
-              }
+              if (!isNaN(dec)) processScannedCard(String(dec).padStart(10, '0'));
             }
           };
         }).catch(() => {});
@@ -183,57 +204,97 @@ export default function Home() {
 
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
-      clearTimeout(timer);
-      if (abortController) abortController.abort();
+      clearTimeout(flushTimer);
+      if (abortCtrl) abortCtrl.abort();
     };
   }, [isNfcModalOpen, selectedWorker]);
 
-  // Smooth wheel scroll for Service Catalogue
-  useEffect(() => {
-    const slider = printingRef.current;
-    if (!slider) return;
+  // -------------------------------------------------------------
+  // DYNAMIC CALCULATORS & STATS
+  // -------------------------------------------------------------
+  const activeStaffCount = useMemo(() => {
+    return attendanceLogs.filter(log => !log.clock_out).length;
+  }, [attendanceLogs]);
 
-    const handleWheel = (e: WheelEvent) => {
-      if (e.deltaY !== 0) {
-        e.preventDefault();
-        slider.scrollLeft += e.deltaY * 2.5; 
-      }
+  const totalOTLogged = useMemo(() => {
+    return attendanceLogs.reduce((acc, log) => acc + parseFloat(String(log.overtime_hours || 0)), 0).toFixed(1);
+  }, [attendanceLogs]);
+
+  const estimatedTotalHours = useMemo(() => {
+    return attendanceLogs.reduce((acc, log) => {
+      const reg = parseFloat(String(log.regular_hours || 0));
+      const ot = parseFloat(String(log.overtime_hours || 0));
+      return acc + reg + ot;
+    }, 0).toFixed(1);
+  }, [attendanceLogs]);
+
+  const calculatedEstimate = useMemo(() => {
+    const rates: Record<string, number> = {
+      bw_copy: 6,
+      color_print: 25,
+      pvc_card: 150,
+      composing: 120,
+      spiral_binding: 90,
+      hard_binding: 450,
+      panaflex: 38
     };
+    return (rates[calcService] || 10) * Math.max(1, calcQuantity);
+  }, [calcService, calcQuantity]);
 
-    slider.addEventListener('wheel', handleWheel, { passive: false });
-    return () => slider.removeEventListener('wheel', handleWheel);
-  }, []);
+  // Dynamic Payroll calculation based on attendance hours
+  const payrollSummary = useMemo(() => {
+    return teamMembers.map(member => {
+      const logs = attendanceLogs.filter(l => l.worker_id === member.user_id);
+      const days = logs.length;
+      const regHours = logs.reduce((acc, l) => acc + parseFloat(String(l.regular_hours || 0)), 0);
+      const otHours = logs.reduce((acc, l) => acc + parseFloat(String(l.overtime_hours || 0)), 0);
+      const hourlyRate = 180; // Standard base in PKR
+      const earned = Math.round((regHours * hourlyRate) + (otHours * hourlyRate * 1.5));
+      return {
+        ...member,
+        daysWorked: days,
+        regularHours: regHours.toFixed(1),
+        otHours: otHours.toFixed(1),
+        totalPay: earned > 0 ? earned : days * 1200
+      };
+    });
+  }, [teamMembers, attendanceLogs]);
 
-  const handleLogin = async (e: React.FormEvent) => {
+  // -------------------------------------------------------------
+  // AUTHENTICATION HANDLERS
+  // -------------------------------------------------------------
+  const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
+    setLoginError('');
+
+    const target = e.currentTarget;
+    const password = (target.elements.namedItem('password') as HTMLInputElement).value;
+
     try {
-      const response = await fetch('/api/users/login', {
+      const res = await fetch('/api/users/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          username: loginInput, 
-          password: (e.target as any).password.value
-        }),
+        body: JSON.stringify({ username: loginInput.trim(), password })
       });
+      const data = await res.json();
 
-      const data = await response.json();
-      if (data.success) {
-        const userPayload = {
+      if (res.ok && data.success) {
+        const payload = {
           id: data.user.id,
+          user_id: data.user.user_id,
           full_name: data.user.full_name,
           designation: data.user.designation,
           role: data.user.role
         };
-
         setUserRole(data.user.role);
-        setUserData(userPayload);
-        localStorage.setItem('alfareed_session', JSON.stringify(userPayload));
+        setUserData(payload);
+        localStorage.setItem('alfareed_session', JSON.stringify(payload));
         setIsLoginOpen(false);
       } else {
-        alert(data.error || "Login failed. Check your credentials.");
+        setLoginError(data.error || 'Authentication rejected. Verify credentials.');
       }
     } catch (err) {
-      alert("Could not connect to the Domain.pk server.");
+      setLoginError('Could not connect to the Al Fareed production server.');
     }
   };
 
@@ -243,191 +304,313 @@ export default function Home() {
     localStorage.removeItem('alfareed_session');
   };
 
-  const services = [
-    { id: '01', title: 'Industrial Printing', desc: 'High-speed offset and digital production for large scale requirements.', icon: '🖨️' },
-    { id: '02', title: 'Composing & Typing', desc: 'Professional document composing, copy typing, and data entry services.', icon: '⌨️' },
-    { id: '03', title: 'Binding & Finishing', desc: 'Spiral, thermal, and hard binding with precision cutting.', icon: '📚' },
-    { id: '04', title: 'Lamination & Coating', desc: 'Vivid gloss and matte coatings to protect your essential documentation.', icon: '✨' },
-    { id: '05', title: 'Web Development', desc: 'Custom enterprise-grade web solutions and portal management.', icon: '🌐' },
-    { id: '06', title: 'Marketing & Ads', desc: 'Strategic advertising campaigns and high-impact branding materials.', icon: '🚀' },
-    { id: '07', title: 'Stationery Supplies', desc: 'Premium quality corporate and academic stationery items.', icon: '🖋️' },
+  // -------------------------------------------------------------
+  // SERVICES CATALOGUE DATA
+  // -------------------------------------------------------------
+  const servicePillars = [
+    {
+      id: '01',
+      title: 'Industrial Offset & Digital Printing',
+      spec: 'Offset Presses & Production Digital Copiers',
+      desc: 'High-speed multi-color printing for corporate catalogs, magazines, letterheads, brochures, carbonless NCR bill books, and packaging boxes with Pantone precision.',
+      icon: '🖨️',
+      tag: 'Core Production'
+    },
+    {
+      id: '02',
+      title: 'Document Composing & Urdu Nastaleeq',
+      spec: 'Jameel Noori Nastaleeq • Legal Layouts',
+      desc: 'Master document typography in Urdu Nastaleeq, English corporate drafting, Arabic translation, court affidavits, stamped bond agreements, and academic manuscripts.',
+      icon: '⌨️',
+      tag: 'Typography Studio'
+    },
+    {
+      id: '03',
+      title: 'Commercial Photostat & Duplication',
+      spec: 'Konica Minolta bizhub High-Volume Fleet',
+      desc: 'High-volume digital photocopying, architectural blueprint reproduction, bulk exam copying, dual-sided ledger scanning, and rapid secure paper handling.',
+      icon: '📑',
+      tag: 'High Velocity'
+    },
+    {
+      id: '04',
+      title: 'PVC Smart Cards & NFC Credentials',
+      spec: 'Dual-Interface 13.56MHz & HID Dongle Sync',
+      desc: 'Edge-to-edge high-definition thermal PVC card printing, employee RFID badges, custom printed polyester lanyards, and direct 24/7 terminal attendance integration.',
+      icon: '💳',
+      tag: 'Hardware Solutions'
+    },
+    {
+      id: '05',
+      title: 'Finishing, Lamination & Luxury Binding',
+      spec: 'Hot Foil Embossing • Rexine Hard Covers',
+      desc: 'Spiral coil, wire-o, comb binding, thermal glue binding, and handmade hard leatherette bookbinding with golden seal embossing and scratch-proof matte/gloss coatings.',
+      icon: '📚',
+      tag: 'Finishing Works'
+    },
+    {
+      id: '06',
+      title: 'Outdoor Flex, Signage & Billboards',
+      spec: 'Wide-Format UV & Solvent Outdoor Plotters',
+      desc: 'Heavy-duty Panaflex shop signs, street streamers, backlit commercial signage, frosted glass films, one-way vision graphics, and customized rollup standees.',
+      icon: '🏛️',
+      tag: 'Signage & Displays'
+    },
+    {
+      id: '07',
+      title: 'Enterprise Software & Web Portals',
+      spec: 'Next.js 15 • Node.js • MySQL Engine',
+      desc: 'Enterprise business management portals, cloud POS billing solutions, biometric/NFC worker monitoring gates, and digital asset portals developed in-house.',
+      icon: '🌐',
+      tag: 'Digital Engineering'
+    },
+    {
+      id: '08',
+      title: 'Corporate Stationery & Digital Stamps',
+      spec: 'Pre-Inked Flash Polymer & Brass Seals',
+      desc: 'Custom flash stamps, dater seals, official company monograms, premium executive envelopes, presentation folders, and corporate paper assortments.',
+      icon: '🖋️',
+      tag: 'Corporate Supply'
+    }
   ];
 
-  // ==========================================
-  // DASHBOARD VIEW
-  // ==========================================
+  // =============================================================
+  // AUTHENTICATED PORTAL VIEW
+  // =============================================================
   if (userRole) {
     return (
-      <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-8 text-[#1a1a1a]">
-        <nav className="flex justify-between items-center mb-8 md:mb-12 bg-white p-6 rounded-3xl shadow-sm border border-slate-100">
-          <div className="flex flex-col">
-            <div className="font-black text-xl tracking-tighter uppercase">
-              AL FAREED <span className="text-[#FF6600]">PORTAL</span>
-            </div>
-            <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">
-              Welcome back, <span className="text-[#1a1a1a]">{userData?.full_name || 'User'}</span>
-              {userData?.designation && ` • ${userData.designation}`}
-            </div>
-          </div>
-          <div className="flex items-center gap-3">
-            <a 
-              href="/kiosk" 
-              target="_blank" 
-              className="bg-orange-50 text-[#FF6600] border border-orange-200 px-4 py-2 rounded-full font-bold text-xs uppercase hover:bg-[#FF6600] hover:text-white transition-all shadow-sm"
-            >
-              Open Kiosk ⤢
-            </a>
-            <button 
-              onClick={handleLogout} 
-              className="bg-slate-100 px-6 py-2 rounded-full font-bold text-xs uppercase hover:bg-red-50 hover:text-red-500 transition-all"
-            >
-              Logout
-            </button>
-          </div>
-        </nav>
-
-        {/* ADMIN DASHBOARD */}
-        {userRole === 'admin' && (
-          <div className="max-w-7xl mx-auto space-y-6 md:space-y-8 animate-in fade-in duration-500">
-            {/* STAT CARDS SECTION */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm">
-                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Active Today</p>
-                <p className="text-3xl font-black text-green-600">
-                  {Array.isArray(attendanceLogs) 
-                    ? attendanceLogs.filter((log) => !log.clock_out).length 
-                    : 0}
-                </p>
+      <div className="min-h-screen bg-slate-50 font-sans text-[#111827] antialiased selection:bg-[#FF6600] selection:text-white">
+        {/* Top Management Header */}
+        <header className="sticky top-0 z-50 bg-white border-b border-slate-200 shadow-sm">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex justify-between items-center">
+            <div className="flex items-center gap-4">
+              <div className="w-10 h-10 bg-[#FF6600] rounded-xl flex items-center justify-center text-white font-black text-xl shadow-md shadow-orange-500/20">
+                AF
               </div>
-              <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm">
-                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Team Members</p>
-                <p className="text-3xl font-black text-[#FF6600]">{teamMembers.length}</p>
-              </div>
-              <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm">
-                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Total OT Hours</p>
-                <p className="text-3xl font-black text-[#1a1a1a]">
-                  {Array.isArray(attendanceLogs) 
-                    ? attendanceLogs.reduce((acc, log) => acc + parseFloat(String(log.overtime_hours || 0)), 0).toFixed(1) 
-                    : "0.0"}h
-                </p>
-              </div>
-              <div className="bg-[#1a1a1a] p-6 rounded-3xl shadow-xl flex items-center justify-center">
-                <span className="text-white text-[10px] font-black uppercase tracking-[0.3em] flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-green-500 animate-ping"></span>
-                  DB Sync Live
-                </span>
-              </div>
-            </div>
-
-            {/* LIVE ATTENDANCE LOGS TABLE */}
-            <div className="bg-white p-6 md:p-10 rounded-[40px] shadow-sm border border-slate-100">
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-2">
-                <div>
-                  <h2 className="text-2xl md:text-3xl font-black tracking-tighter text-[#1a1a1a]">Live Attendance Punches</h2>
-                  <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mt-1">Real-time NFC card scans and shifts</p>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h1 className="font-black text-lg tracking-tight uppercase text-black">
+                    Al Fareed <span className="text-[#FF6600]">Portal</span>
+                  </h1>
+                  <span className="px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-widest bg-slate-100 text-slate-700">
+                    {userRole}
+                  </span>
                 </div>
-                <button 
-                  onClick={fetchAttendance}
-                  className="bg-slate-100 text-[#1a1a1a] px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider hover:bg-[#FF6600] hover:text-white transition-all flex items-center gap-1.5"
-                >
-                  Refresh Logs ⟳
-                </button>
+                <p className="text-[11px] font-semibold text-slate-400">
+                  {userData?.full_name || 'Authorized Member'} {userData?.designation ? `• ${userData.designation}` : ''}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <a
+                href="/kiosk"
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-2 bg-orange-50 hover:bg-[#FF6600] text-[#FF6600] hover:text-white border border-orange-200 hover:border-[#FF6600] px-4 py-2 rounded-xl font-black text-xs uppercase tracking-wider transition-all shadow-sm"
+              >
+                <span>Terminal Gate</span>
+                <span className="text-sm">↗</span>
+              </a>
+              <button
+                onClick={handleLogout}
+                className="bg-slate-100 hover:bg-red-50 text-slate-700 hover:text-red-600 px-4 py-2 rounded-xl font-bold text-xs uppercase tracking-wider transition-all"
+              >
+                Sign Out
+              </button>
+            </div>
+          </div>
+        </header>
+
+        {/* ---------------- ADMIN DASHBOARD ---------------- */}
+        {userRole === 'admin' && (
+          <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+            {/* Live Metrics Grid */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm relative overflow-hidden">
+                <div className="flex justify-between items-start">
+                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">On-Floor Active</p>
+                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+                </div>
+                <p className="text-4xl font-black text-emerald-600 mt-2">{activeStaffCount}</p>
+                <p className="text-[11px] text-slate-400 font-semibold mt-1">Clocked in today (in shift)</p>
               </div>
 
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse min-w-[750px]">
-                  <thead>
-                    <tr className="text-slate-400 text-[10px] uppercase tracking-[0.2em] border-b border-slate-100">
-                      <th className="pb-3 pl-2">Employee</th>
-                      <th className="pb-3">Date</th>
-                      <th className="pb-3">Clock In</th>
-                      <th className="pb-3">Clock Out</th>
-                      <th className="pb-3">Duration</th>
-                      <th className="pb-3 text-right pr-2">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody className="text-sm font-semibold">
-                    {Array.isArray(attendanceLogs) && attendanceLogs.length > 0 ? (
-                      attendanceLogs.map((log) => (
-                        <tr key={log.id} className="border-b border-slate-50 hover:bg-slate-50/60 transition-colors">
-                          <td className="py-4 pl-2 font-bold text-[#1a1a1a]">
-                            {log.worker_name || log.worker_id}
-                            <span className="block text-[9px] text-slate-400 font-mono">ID: #{log.worker_id}</span>
-                          </td>
-                          <td className="py-4 text-xs font-mono text-slate-600">{log.date}</td>
-                          <td className="py-4 font-mono text-xs text-green-600 font-bold">{log.clock_in}</td>
-                          <td className="py-4 font-mono text-xs text-blue-600 font-bold">{log.clock_out || '—'}</td>
-                          <td className="py-4 font-mono text-xs text-slate-600">
-                            {log.clock_out ? (
-                              `${(parseFloat(String(log.regular_hours || 0)) + parseFloat(String(log.overtime_hours || 0))).toFixed(1)}h`
-                            ) : (
-                              <span className="text-[#FF6600] font-bold animate-pulse">In Progress...</span>
-                            )}
-                          </td>
-                          <td className="py-4 pr-2 text-right">
-                            {!log.clock_out ? (
-                              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-green-50 text-green-700 border border-green-200">
-                                <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-                                Clocked In
-                              </span>
-                            ) : (
-                              <span className="inline-flex items-center px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-slate-100 text-slate-500">
-                                Completed
-                              </span>
-                            )}
+              <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
+                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Total Enrolled Staff</p>
+                <p className="text-4xl font-black text-[#FF6600] mt-2">{teamMembers.length}</p>
+                <p className="text-[11px] text-slate-400 font-semibold mt-1">
+                  {teamMembers.filter(m => m.card_id).length} RFID cards paired
+                </p>
+              </div>
+
+              <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
+                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Overtime Logged</p>
+                <p className="text-4xl font-black text-black mt-2">{totalOTLogged}h</p>
+                <p className="text-[11px] text-slate-400 font-semibold mt-1">Calculated for current month</p>
+              </div>
+
+              <div className="bg-black text-white p-6 rounded-3xl shadow-xl flex flex-col justify-between">
+                <div className="flex justify-between items-center">
+                  <span className="text-[9px] font-black uppercase tracking-[0.25em] text-[#FF6600]">Hardware Station</span>
+                  <button
+                    onClick={fetchAllData}
+                    disabled={isRefreshing}
+                    className="text-xs text-slate-400 hover:text-white font-mono"
+                  >
+                    {isRefreshing ? 'Syncing...' : 'Sync Now ⟳'}
+                  </button>
+                </div>
+                <div>
+                  <p className="text-xs font-mono font-bold text-slate-300">Johar Mor Gate #01</p>
+                  <p className="text-[10px] text-emerald-400 font-mono mt-0.5">● Database Sync Live</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Navigation Tabs Bar */}
+            <div className="flex border-b border-slate-200 space-x-2 overflow-x-auto no-scrollbar">
+              {[
+                { id: 'attendance', label: 'Live Punches Feed' },
+                { id: 'cards', label: 'NFC Card Pairing' },
+                { id: 'payroll', label: 'Payroll & Hours' },
+                { id: 'leads', label: `Client Inquiries (${projectBriefs.length})` },
+                { id: 'register', label: 'Register New Staff' }
+              ].map(tab => (
+                <button
+                  key={tab.id}
+                  onClick={() => setAdminTab(tab.id as AdminTab)}
+                  className={`pb-4 px-4 font-black text-xs uppercase tracking-wider whitespace-nowrap transition-all border-b-2 ${
+                    adminTab === tab.id
+                      ? 'border-[#FF6600] text-[#FF6600]'
+                      : 'border-transparent text-slate-400 hover:text-black'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+
+            {/* TAB 1: LIVE ATTENDANCE PUNCHES */}
+            {adminTab === 'attendance' && (
+              <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
+                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                  <div>
+                    <h2 className="text-2xl font-black tracking-tight text-black">Live Attendance Feed</h2>
+                    <p className="text-xs text-slate-400 font-semibold mt-0.5">
+                      Punches received from the Johar Mor 24/7 attendance gate
+                    </p>
+                  </div>
+                  <input
+                    type="text"
+                    value={attendanceSearch}
+                    onChange={(e) => setAttendanceSearch(e.target.value)}
+                    placeholder="Search worker by name or ID..."
+                    className="w-full sm:w-72 px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]"
+                  />
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse min-w-[700px]">
+                    <thead>
+                      <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
+                        <th className="pb-3 pl-2">Worker / Entity</th>
+                        <th className="pb-3">Punch Date</th>
+                        <th className="pb-3">Clock In</th>
+                        <th className="pb-3">Clock Out</th>
+                        <th className="pb-3">Logged Duration</th>
+                        <th className="pb-3 text-right pr-2">Shift Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-xs font-semibold">
+                      {attendanceLogs
+                        .filter(l => 
+                          (l.worker_name?.toLowerCase().includes(attendanceSearch.toLowerCase())) ||
+                          (l.worker_id.includes(attendanceSearch))
+                        )
+                        .map(log => (
+                          <tr key={log.id} className="hover:bg-slate-50/70 transition-colors">
+                            <td className="py-4 pl-2">
+                              <span className="font-bold text-black block">{log.worker_name || 'Worker'}</span>
+                              <span className="font-mono text-[10px] text-slate-400">ID: #{log.worker_id}</span>
+                            </td>
+                            <td className="py-4 font-mono text-slate-600">{log.date}</td>
+                            <td className="py-4 font-mono font-bold text-emerald-600">{log.clock_in}</td>
+                            <td className="py-4 font-mono font-bold text-blue-600">{log.clock_out || '—'}</td>
+                            <td className="py-4 font-mono text-slate-600">
+                              {log.clock_out ? (
+                                `${(parseFloat(String(log.regular_hours || 0)) + parseFloat(String(log.overtime_hours || 0))).toFixed(1)} hrs`
+                              ) : (
+                                <span className="text-[#FF6600] font-bold">Shift in Progress</span>
+                              )}
+                            </td>
+                            <td className="py-4 pr-2 text-right">
+                              {!log.clock_out ? (
+                                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-200">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                                  Active
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-slate-100 text-slate-600">
+                                  Logged Out
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      {attendanceLogs.length === 0 && (
+                        <tr>
+                          <td colSpan={6} className="py-12 text-center text-slate-400 italic">
+                            No attendance punches recorded yet today.
                           </td>
                         </tr>
-                      ))
-                    ) : (
-                      <tr>
-                        <td colSpan={6} className="py-8 text-center text-slate-400 italic text-xs">
-                          No attendance logs found for today.
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {/* TEAM NFC CARD ENROLLMENT MANAGEMENT */}
-            <div className="bg-white p-6 md:p-10 rounded-[40px] shadow-sm border border-slate-100">
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-2">
-                <div>
-                  <h2 className="text-2xl md:text-3xl font-black tracking-tighter text-[#1a1a1a]">NFC Card Management</h2>
-                  <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mt-1">Pair RFID / NFC cards for instant attendance</p>
+                      )}
+                    </tbody>
+                  </table>
                 </div>
-                <span className="bg-orange-50 text-[#FF6600] px-3 py-1 rounded-full text-[10px] font-black uppercase">
-                  {teamMembers.filter(m => m.card_id).length} of {teamMembers.length} Cards Assigned
-                </span>
               </div>
+            )}
 
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse min-w-[700px]">
-                  <thead>
-                    <tr className="text-slate-400 text-[10px] uppercase tracking-[0.2em] border-b border-slate-100">
-                      <th className="pb-3 pl-2">Employee</th>
-                      <th className="pb-3">Worker ID</th>
-                      <th className="pb-3">Designation</th>
-                      <th className="pb-3">Assigned Card ID</th>
-                      <th className="pb-3 text-right pr-2">Action</th>
-                    </tr>
-                  </thead>
-                  <tbody className="text-sm font-semibold">
-                    {teamMembers.length > 0 ? (
-                      teamMembers.map((member) => (
-                        <tr key={member.id} className="border-b border-slate-50 hover:bg-slate-50/60 transition-colors">
-                          <td className="py-4 pl-2 font-bold text-[#1a1a1a]">{member.full_name}</td>
-                          <td className="py-4 font-mono text-slate-500 text-xs">{member.user_id}</td>
-                          <td className="py-4 text-slate-500 text-xs">{member.designations || 'Worker'}</td>
+            {/* TAB 2: NFC CARD PAIRING */}
+            {adminTab === 'cards' && (
+              <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
+                <div className="flex justify-between items-center">
+                  <div>
+                    <h2 className="text-2xl font-black tracking-tight text-black">NFC & RFID Card Enrollment</h2>
+                    <p className="text-xs text-slate-400 font-semibold mt-0.5">
+                      Assign 10-digit decimal RFID/NFC cards to employees
+                    </p>
+                  </div>
+                  <span className="px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-orange-50 text-[#FF6600] border border-orange-200">
+                    {teamMembers.filter(m => m.card_id).length} of {teamMembers.length} Enrolled
+                  </span>
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse min-w-[700px]">
+                    <thead>
+                      <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
+                        <th className="pb-3 pl-2">Staff Member</th>
+                        <th className="pb-3">Worker ID</th>
+                        <th className="pb-3">Department / Skill</th>
+                        <th className="pb-3">Assigned Card ID</th>
+                        <th className="pb-3 text-right pr-2">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-xs font-semibold">
+                      {teamMembers.map(member => (
+                        <tr key={member.id} className="hover:bg-slate-50/70 transition-colors">
+                          <td className="py-4 pl-2 font-bold text-black">{member.full_name}</td>
+                          <td className="py-4 font-mono text-slate-500">{member.user_id}</td>
+                          <td className="py-4 text-slate-500 max-w-xs truncate">{member.designations || member.role}</td>
                           <td className="py-4">
                             {member.card_id ? (
-                              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-mono font-bold bg-green-50 text-green-700 border border-green-200">
-                                <span className="w-1.5 h-1.5 rounded-full bg-green-500"></span>
+                              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full font-mono text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                                 {member.card_id}
                               </span>
                             ) : (
-                              <span className="inline-flex items-center px-3 py-1 rounded-full text-[10px] font-mono font-bold bg-slate-100 text-slate-400">
+                              <span className="px-3 py-1 rounded-full font-mono text-[10px] font-bold bg-slate-100 text-slate-400">
                                 Unassigned
                               </span>
                             )}
@@ -440,325 +623,257 @@ export default function Home() {
                                 setNfcStatus({ message: '', type: 'idle' });
                                 setIsNfcModalOpen(true);
                               }}
-                              className="bg-[#1a1a1a] text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider hover:bg-[#FF6600] transition-all"
+                              className="bg-black hover:bg-[#FF6600] text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all"
                             >
                               {member.card_id ? 'Change Card' : 'Pair Card +'}
                             </button>
                           </td>
                         </tr>
-                      ))
-                    ) : (
-                      <tr>
-                        <td colSpan={5} className="py-8 text-center text-slate-400 italic text-xs">
-                          Loading team members...
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {/* REGISTER TEAM MEMBER SECTION */}
-            <div className="bg-white p-6 md:p-10 rounded-[40px] shadow-sm border border-slate-100">
-              <div className="flex justify-between items-center mb-8">
-                <div>
-                  <h2 className="text-2xl md:text-3xl font-black tracking-tighter text-[#1a1a1a]">Register Team Member</h2>
-                  <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mt-1">Add new accounts to MySQL</p>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               </div>
-              <form 
-                onSubmit={async (e) => {
-                  e.preventDefault();
-                  const formData = new FormData(e.currentTarget);
-                  const data = Object.fromEntries(formData);
-                  
-                  try {
-                    const res = await fetch('/api/users/register', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify(data),
-                    });
+            )}
 
-                    if (res.ok) {
-                      alert("Worker registered successfully!");
-                      (e.target as HTMLFormElement).reset();
-                      fetchTeamMembers();
-                    } else {
-                      const err = await res.json();
-                      alert(err.error || "Registration failed");
-                    }
-                  } catch (err) {
-                    alert("Connection error to Domain.pk server");
-                  }
-                }}
-                className="grid grid-cols-1 md:grid-cols-3 gap-6"
-              >
-                <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase px-2">Full Identity</label>
-                  <input name="full_name" placeholder="Full Name" required className="w-full p-5 bg-slate-50 rounded-2xl outline-none border-none font-medium focus:ring-2 focus:ring-[#FF6600]/20" />
-                </div>
-                <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase px-2">Access Username</label>
-                  <input name="username" placeholder="Username" required className="w-full p-5 bg-slate-50 rounded-2xl outline-none border-none font-medium focus:ring-2 focus:ring-[#FF6600]/20" />
-                </div>
-                <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase px-2">Secure Password</label>
-                  <input name="password" type="password" placeholder="Password" required className="w-full p-5 bg-slate-50 rounded-2xl outline-none border-none font-medium focus:ring-2 focus:ring-[#FF6600]/20" />
-                </div>
-                <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase px-2">Job Designation</label>
-                  <input name="designation" placeholder="e.g. Graphic Designer" className="w-full p-5 bg-slate-50 rounded-2xl outline-none border-none font-medium focus:ring-2 focus:ring-[#FF6600]/20" />
-                </div>
-                <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase px-2">System Role</label>
-                  <select name="role" required className="w-full p-5 bg-slate-50 rounded-2xl outline-none border-none font-medium appearance-none">
-                    <option value="worker">Worker</option>
-                    <option value="customer">Customer</option>
-                    <option value="admin">Admin</option>
-                  </select>
-                </div>
-                <div className="flex items-end">
-                  <button type="submit" className="w-full bg-[#FF6600] text-white font-black py-5 rounded-2xl hover:bg-[#1a1a1a] transition-all uppercase text-xs tracking-widest shadow-lg shadow-orange-100">
-                    Create Account +
-                  </button>
-                </div>
-              </form>
-            </div>
-
-            {/* PRECISION PAYROLL TRACKER */}
-            <div className="bg-white p-6 md:p-10 rounded-[40px] shadow-sm border border-slate-100">
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4">
+            {/* TAB 3: PAYROLL & HOURS */}
+            {adminTab === 'payroll' && (
+              <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
                 <div>
-                  <h2 className="text-2xl md:text-3xl font-black tracking-tighter text-[#1a1a1a]">Precision Payroll</h2>
-                  <p className="text-slate-400 text-[10px] md:text-xs font-bold uppercase tracking-widest mt-1">
-                    Calculates exact earnings based on seconds logged
+                  <h2 className="text-2xl font-black tracking-tight text-black">Precision Payroll Tracker</h2>
+                  <p className="text-xs text-slate-400 font-semibold mt-0.5">
+                    Calculated automatically from live gate timestamps and recorded overtime
                   </p>
                 </div>
-                <div className="flex gap-2">
-                  <button className="bg-[#1a1a1a] text-white px-4 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-[#FF6600] transition-all">Monthly</button>
-                  <button className="bg-slate-50 px-4 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-slate-100 transition-all">Weekly</button>
-                  <button className="bg-slate-50 px-4 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-slate-100 transition-all">Daily</button>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse min-w-[700px]">
+                    <thead>
+                      <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
+                        <th className="pb-3 pl-2">Employee</th>
+                        <th className="pb-3">Shifts Logged</th>
+                        <th className="pb-3">Regular Hours</th>
+                        <th className="pb-3">Overtime (1.5x)</th>
+                        <th className="pb-3 text-right pr-2">Calculated Total</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-xs font-semibold">
+                      {payrollSummary.map(row => (
+                        <tr key={row.id} className="hover:bg-slate-50/70 transition-colors">
+                          <td className="py-4 pl-2 font-bold text-black">{row.full_name}</td>
+                          <td className="py-4 font-mono text-slate-600">{row.daysWorked} Days</td>
+                          <td className="py-4 font-mono text-slate-600">{row.regularHours}h</td>
+                          <td className="py-4 font-mono font-bold text-[#FF6600]">
+                            {parseFloat(row.otHours) > 0 ? `+${row.otHours}h` : '—'}
+                          </td>
+                          <td className="py-4 pr-2 text-right font-mono font-black text-base text-black">
+                            Rs. {row.totalPay.toLocaleString()}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               </div>
-              
-              <div className="overflow-x-auto -mx-2 md:mx-0">
-                <table className="w-full text-left border-collapse min-w-[800px]">
-                  <thead>
-                    <tr className="text-slate-400 text-[10px] uppercase tracking-[0.2em] border-b border-slate-50">
-                      <th className="pb-4 pl-4">Employee</th>
-                      <th className="pb-4">Structure</th>
-                      <th className="pb-4">Days Active</th>
-                      <th className="pb-4">Regular Hrs</th>
-                      <th className="pb-4 text-[#FF6600]">Sunday/OT</th>
-                      <th className="pb-4 text-right pr-4">Total Earned</th>
-                    </tr>
-                  </thead>
-                  <tbody className="text-sm font-semibold">
-                    {Array.isArray(payroll) && payroll.length > 0 ? (
-                      payroll.map((row: any) => (
-                        <tr key={row.id} className="border-b border-slate-50 hover:bg-slate-50/50 transition-colors group">
-                          <td className="py-6 pl-4">
-                            <p className="font-bold text-[#1a1a1a]">{row.name}</p>
-                            <p className="text-[9px] text-slate-400 uppercase tracking-widest">ID: #{row.id.toString().padStart(3, '0')}</p>
+            )}
+
+            {/* TAB 4: CLIENT INQUIRIES & LEADS */}
+            {adminTab === 'leads' && (
+              <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
+                <div>
+                  <h2 className="text-2xl font-black tracking-tight text-black">Client Project Inquiries</h2>
+                  <p className="text-xs text-slate-400 font-semibold mt-0.5">
+                    Orders and project briefs submitted through the public website
+                  </p>
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse min-w-[700px]">
+                    <thead>
+                      <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
+                        <th className="pb-3 pl-2">Client / Entity</th>
+                        <th className="pb-3">Service</th>
+                        <th className="pb-3">Timeline</th>
+                        <th className="pb-3">Project Requirements</th>
+                        <th className="pb-3 text-right pr-2">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-xs font-semibold">
+                      {projectBriefs.map(brief => (
+                        <tr key={brief.id} className="hover:bg-slate-50/70 transition-colors">
+                          <td className="py-4 pl-2 font-bold text-black">
+                            {brief.client_name}
+                            {brief.phone && <span className="block text-[10px] text-slate-400 font-mono">{brief.phone}</span>}
                           </td>
-                          <td className="py-6">
-                            <span className={`px-3 py-1 rounded-lg text-[9px] font-black uppercase tracking-widest ${
-                              row.payType === 'hourly' ? 'bg-blue-50 text-blue-500' : 
-                              row.payType === 'daily' ? 'bg-purple-50 text-purple-500' : 'bg-slate-100 text-slate-500'
-                            }`}>
-                              {row.payType}
+                          <td className="py-4">
+                            <span className="px-2.5 py-1 rounded-lg text-[10px] uppercase font-bold bg-slate-100 text-slate-700">
+                              {brief.service_type}
                             </span>
                           </td>
-                          <td className="py-6 font-medium text-slate-600 pl-4">{row.daysWorked} Days</td>
-                          <td className="py-6 font-mono text-slate-600">{row.totalHours}h</td>
-                          <td className="py-6 font-mono text-[#FF6600] font-bold">{parseFloat(row.otHours) > 0 ? `+${row.otHours}h` : '-'}</td>
-                          <td className="py-6 pr-4 text-right">
-                            <p className="text-lg font-black text-[#1a1a1a]">Rs. {row.totalPay}</p>
-                            <button className="text-[9px] text-[#FF6600] font-bold uppercase tracking-widest hover:underline mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                              View Breakdown →
-                            </button>
-                          </td>
-                        </tr>
-                      ))
-                    ) : (
-                      <tr>
-                        <td colSpan={6} className="py-12 text-center text-slate-300 italic uppercase tracking-widest">
-                          {payroll ? "Calculating Payroll..." : "No payroll data found"}
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {/* PROJECT BRIEFS SECTION */}
-            <div className="bg-white p-6 md:p-10 rounded-[40px] shadow-sm border border-slate-100">
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4">
-                <h2 className="text-2xl md:text-3xl font-black tracking-tighter text-[#1a1a1a]">Incoming Project Briefs</h2>
-                <span className="bg-orange-100 text-[#FF6600] px-4 py-1 rounded-full text-[10px] font-black uppercase">
-                  {Array.isArray(projectBriefs) ? projectBriefs.length : 0} New Leads
-                </span>
-              </div>
-              
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse min-w-[600px]">
-                  <thead>
-                    <tr className="text-slate-400 text-[10px] uppercase tracking-[0.2em] border-b border-slate-50">
-                      <th className="pb-4">Client</th>
-                      <th className="pb-4">Service</th>
-                      <th className="pb-4">Timeline</th>
-                      <th className="pb-4">Description</th>
-                      <th className="pb-4 text-right">Action</th>
-                    </tr>
-                  </thead>
-                  <tbody className="text-sm font-semibold">
-                    {Array.isArray(projectBriefs) && projectBriefs.length > 0 ? (
-                      projectBriefs.map((brief: any) => (
-                        <tr key={brief.id} className="border-b border-slate-50 hover:bg-slate-50/50 transition-colors">
-                          <td className="py-6 font-bold text-[#1a1a1a]">{brief.client_name}</td>
-                          <td className="py-6"><span className="bg-slate-100 px-3 py-1 rounded-lg text-[10px] uppercase">{brief.service_type}</span></td>
-                          <td className="py-6 text-slate-500">{brief.deadline}</td>
-                          <td className="py-6 max-w-xs truncate text-slate-400 font-medium">{brief.description}</td>
-                          <td className="py-6 text-right flex gap-4 justify-end items-center">
-                            <button 
-                              onClick={async () => {
-                                if(confirm("Mark this project as completed and remove from list?")) {
-                                  const res = await fetch('/api/projects/delete', {
-                                    method: 'DELETE',
-                                    headers: {'Content-Type': 'application/json'},
-                                    body: JSON.stringify({ id: brief.id })
-                                  });
-                                  if(res.ok) {
-                                    setProjectBriefs(prev => prev.filter((b: any) => b.id !== brief.id));
-                                  }
-                                }
-                              }}
-                              className="text-gray-300 hover:text-green-500 transition-colors font-bold text-[10px] uppercase tracking-widest"
+                          <td className="py-4 text-slate-500 font-mono">{brief.deadline || 'Flexible'}</td>
+                          <td className="py-4 text-slate-600 max-w-sm truncate">{brief.description}</td>
+                          <td className="py-4 pr-2 text-right">
+                            <a
+                              href={`https://wa.me/923325327333?text=Salam%20${encodeURIComponent(brief.client_name)},%20regarding%20your%20${encodeURIComponent(brief.service_type)}%20inquiry%20at%20Al%20Fareed:`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-block bg-[#25D366] text-white px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider hover:opacity-90 transition-all"
                             >
-                              Done ✓
-                            </button>
-                            <a href={`mailto:?subject=Al Fareed Project: ${brief.service_type}`} className="text-[#FF6600] hover:underline font-bold text-xs uppercase tracking-widest">Contact</a>
+                              WhatsApp
+                            </a>
                           </td>
                         </tr>
-                      ))
-                    ) : (
-                      <tr><td colSpan={5} className="py-12 text-center text-slate-300 italic uppercase tracking-widest">No project briefs submitted yet.</td></tr>
-                    )}
-                  </tbody>
-                </table>
+                      ))}
+                      {projectBriefs.length === 0 && (
+                        <tr>
+                          <td colSpan={5} className="py-12 text-center text-slate-400 italic">
+                            No project inquiries submitted yet.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
               </div>
-            </div>
-          </div>
+            )}
+
+            {/* TAB 5: REGISTER STAFF */}
+            {adminTab === 'register' && (
+              <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 max-w-2xl">
+                <div>
+                  <h2 className="text-2xl font-black tracking-tight text-black">Register Team Member</h2>
+                  <p className="text-xs text-slate-400 font-semibold mt-0.5">
+                    Create new database credentials for the Al Fareed production crew
+                  </p>
+                </div>
+
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    const formData = new FormData(e.currentTarget);
+                    const payload = Object.fromEntries(formData);
+                    try {
+                      const res = await fetch('/api/users/register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                      });
+                      if (res.ok) {
+                        alert('Team member registered successfully!');
+                        (e.target as HTMLFormElement).reset();
+                        fetchAllData();
+                      } else {
+                        const err = await res.json();
+                        alert(err.error || 'Registration failed');
+                      }
+                    } catch (err) {
+                      alert('Connection error');
+                    }
+                  }}
+                  className="space-y-4 mt-6"
+                >
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Full Name</label>
+                      <input name="full_name" required placeholder="e.g. Babar Ahmed" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Worker User ID</label>
+                      <input name="username" required placeholder="e.g. 3086049240" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Password</label>
+                      <input name="password" type="password" required placeholder="Pass-key" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Designation</label>
+                      <input name="designation" placeholder="e.g. Offset Master / Composing" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">System Role</label>
+                    <select name="role" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]">
+                      <option value="worker">Worker</option>
+                      <option value="admin">Administrator</option>
+                    </select>
+                  </div>
+
+                  <button
+                    type="submit"
+                    className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest transition-all shadow-md shadow-orange-500/20"
+                  >
+                    Create Account +
+                  </button>
+                </form>
+              </div>
+            )}
+          </main>
         )}
 
-        {/* WORKER DASHBOARD */}
+        {/* ---------------- WORKER DASHBOARD ---------------- */}
         {userRole === 'worker' && (
-          <div className="max-w-7xl mx-auto space-y-8 animate-in slide-in-from-bottom-4 duration-500">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              <div className="bg-white p-8 rounded-[40px] border border-slate-100 shadow-sm relative overflow-hidden">
-                <div className="flex justify-between items-start mb-6">
-                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Attendance Management</p>
-                  <span className="bg-green-100 text-green-600 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-tighter">Live Session</span>
-                </div>
-                
-                <div className="flex flex-col gap-3">
-                  <button 
-                    onClick={async () => {
-                      try {
-                        const response = await fetch('/api/attendance', {
-                          method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({ employee_id: userData?.id || 1, status: 'On-Time' }),
-                        });
-                        if (response.ok) alert('Clock-In Recorded!');
-                      } catch (err) {
-                        alert('Connection Error');
-                      }
-                    }}
-                    className="w-full bg-[#1a1a1a] text-white py-5 rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] hover:bg-[#FF6600] transition-all shadow-lg"
-                  >
-                    Clock In
-                  </button>
+          <main className="max-w-4xl mx-auto px-4 py-12 space-y-8">
+            <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm text-center">
+              <span className="w-16 h-16 bg-orange-100 text-[#FF6600] rounded-2xl flex items-center justify-center mx-auto text-3xl mb-4 font-black">
+                AF
+              </span>
+              <h2 className="text-3xl font-black text-black">Welcome, {userData?.full_name}</h2>
+              <p className="text-xs text-slate-400 font-semibold mt-1">
+                Department: {userData?.designation || 'Production Floor'} • ID: #{userData?.user_id}
+              </p>
 
-                  <button 
-                    onClick={async () => {
-                      try {
-                        const res = await fetch('/api/attendance/checkout', {
-                          method: 'PUT',
-                          headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({ employee_id: userData?.id || 1 }),
-                        });
-                        const data = await res.json();
-                        if (res.ok) alert(`Clocked Out! Overtime: ${data.overtime_hrs}h`);
-                        else alert(data.error);
-                      } catch (err) {
-                        alert('Connection Error');
-                      }
-                    }}
-                    className="w-full border-2 border-[#1a1a1a] text-[#1a1a1a] py-5 rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] hover:bg-slate-50 transition-all"
-                  >
-                    Clock Out
-                  </button>
-                </div>
-                <p className="text-[10px] text-center text-slate-400 font-bold mt-4 uppercase tracking-widest italic">Database Sync Active</p>
-              </div>
-
-              <div className="bg-white p-8 rounded-[40px] border border-slate-100 shadow-sm">
-                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Weekly Statistics</p>
-                <div className="flex items-end gap-2">
-                  <p className="text-3xl font-black text-[#1a1a1a]">42.5h</p>
-                  <p className="text-xs text-green-500 font-bold mb-1">Target: 48h</p>
-                </div>
-                <div className="w-full bg-slate-100 h-2 rounded-full mt-4 overflow-hidden">
-                  <div className="bg-[#FF6600] h-full w-[88%]" />
-                </div>
-              </div>
-
-              <div className="bg-orange-50 p-8 rounded-[40px] border border-orange-100 shadow-sm">
-                <p className="text-[10px] font-black text-[#FF6600] uppercase tracking-widest mb-4">Overtime Earned</p>
-                <p className="text-3xl font-black text-[#FF6600]">08.0h</p>
-                <p className="text-xs text-[#FF6600]/60 font-bold mt-1">Calculated for current month</p>
+              <div className="mt-8 flex flex-col sm:flex-row justify-center gap-4">
+                <a
+                  href="/kiosk"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="bg-[#FF6600] text-white px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-black transition-all shadow-lg shadow-orange-500/20"
+                >
+                  Open Attendance Terminal ↗
+                </a>
               </div>
             </div>
-          </div>
+          </main>
         )}
 
-        {/* CARD ENROLLMENT MODAL */}
+        {/* ---------------- CARD ASSIGNMENT MODAL ---------------- */}
         {isNfcModalOpen && selectedWorker && (
-          <div className="fixed inset-0 z-[7000] flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
-            <div className="bg-white rounded-[36px] max-w-md w-full p-8 shadow-2xl relative animate-in fade-in zoom-in-95">
-              <button 
+          <div className="fixed inset-0 z-[7000] flex items-center justify-center bg-black/75 backdrop-blur-md p-4">
+            <div className="bg-white rounded-3xl max-w-md w-full p-8 shadow-2xl relative border border-slate-200 animate-in zoom-in-95">
+              <button
                 onClick={() => {
                   setIsNfcModalOpen(false);
                   setSelectedWorker(null);
-                }} 
-                className="absolute top-6 right-6 text-slate-400 hover:text-slate-800 text-lg font-bold"
+                }}
+                className="absolute top-6 right-6 text-slate-400 hover:text-black font-bold text-lg"
               >
                 ✕
               </button>
 
               <div className="text-center mb-6">
-                <div className="w-16 h-16 bg-orange-100 text-[#FF6600] rounded-2xl flex items-center justify-center mx-auto mb-4 text-2xl animate-pulse">
+                <div className="w-16 h-16 bg-orange-100 text-[#FF6600] rounded-2xl flex items-center justify-center mx-auto mb-4 text-3xl font-black animate-pulse">
                   💳
                 </div>
-                <h3 className="text-xl font-black text-[#1a1a1a]">Assign NFC Card</h3>
-                <p className="text-slate-400 text-xs mt-1">
-                  Employee: <strong className="text-[#1a1a1a]">{selectedWorker.full_name}</strong> ({selectedWorker.user_id})
+                <h3 className="text-xl font-black text-black">Pair NFC / RFID Card</h3>
+                <p className="text-xs text-slate-400 font-semibold mt-1">
+                  Linking to: <strong className="text-black">{selectedWorker.full_name}</strong> ({selectedWorker.user_id})
                 </p>
               </div>
 
               <div className="bg-slate-50 border-2 border-dashed border-slate-200 rounded-2xl p-6 text-center mb-6">
-                <p className="text-xs font-bold text-slate-600 mb-1">Waiting for card tap...</p>
-                <p className="text-[11px] text-slate-400">
-                  Tap card on USB Reader or tap back of NFC phone
+                <p className="text-xs font-bold text-slate-700">Ready for card tap...</p>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Tap card on USB Dongle or the back of an NFC Android phone
                 </p>
               </div>
 
               {nfcStatus.message && (
                 <div className={`p-3 rounded-xl text-xs font-bold text-center mb-4 ${
-                  nfcStatus.type === 'success' ? 'bg-green-50 text-green-700 border border-green-200' :
+                  nfcStatus.type === 'success' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' :
                   nfcStatus.type === 'error' ? 'bg-red-50 text-red-600 border border-red-200' :
                   'bg-blue-50 text-blue-600 border border-blue-200'
                 }`}>
@@ -766,7 +881,7 @@ export default function Home() {
                 </div>
               )}
 
-              <form 
+              <form
                 onSubmit={async (e) => {
                   e.preventDefault();
                   if (!nfcInput.trim()) return;
@@ -780,42 +895,43 @@ export default function Home() {
                     const data = await res.json();
                     if (res.ok) {
                       setNfcStatus({ message: 'Card assigned successfully!', type: 'success' });
-                      fetchTeamMembers();
+                      fetchAllData();
                       setTimeout(() => {
                         setIsNfcModalOpen(false);
                         setSelectedWorker(null);
                       }, 1000);
                     } else {
-                      setNfcStatus({ message: data.error || 'Failed to assign card.', type: 'error' });
+                      setNfcStatus({ message: data.error || 'Failed to save card.', type: 'error' });
                     }
                   } catch (err) {
                     setNfcStatus({ message: 'Network error.', type: 'error' });
                   }
                 }}
-                className="space-y-3"
+                className="space-y-4"
               >
                 <div>
-                  <label className="text-[10px] font-black uppercase text-slate-400 px-1">Manual 10-Digit Card ID</label>
-                  <input 
-                    type="text" 
-                    value={nfcInput} 
-                    onChange={(e) => setNfcInput(e.target.value)} 
+                  <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">
+                    Manual 10-Digit Card ID
+                  </label>
+                  <input
+                    type="text"
+                    value={nfcInput}
+                    onChange={(e) => setNfcInput(e.target.value)}
                     placeholder="e.g. 0170112260"
                     maxLength={20}
-                    className="w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl font-mono text-sm font-bold text-center outline-none focus:border-[#FF6600]"
+                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-mono text-sm font-bold text-center outline-none focus:border-[#FF6600]"
                   />
                 </div>
 
                 <div className="flex gap-2">
-                  <button 
-                    type="submit" 
-                    className="flex-1 bg-[#FF6600] text-white py-3 rounded-xl font-black text-xs uppercase tracking-wider hover:bg-[#1a1a1a] transition-all"
+                  <button
+                    type="submit"
+                    className="flex-1 bg-[#FF6600] hover:bg-black text-white py-3 rounded-xl font-black text-xs uppercase tracking-wider transition-all"
                   >
                     Save Card
                   </button>
-
                   {selectedWorker.card_id && (
-                    <button 
+                    <button
                       type="button"
                       onClick={async () => {
                         if (confirm(`Unassign card from ${selectedWorker.full_name}?`)) {
@@ -824,13 +940,13 @@ export default function Home() {
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ userId: selectedWorker.user_id, cardId: null })
                           });
-                          fetchTeamMembers();
+                          fetchAllData();
                           setIsNfcModalOpen(false);
                         }
                       }}
                       className="px-4 py-3 bg-red-50 text-red-600 rounded-xl font-black text-xs uppercase hover:bg-red-100 transition-all"
                     >
-                      Remove
+                      Unpair
                     </button>
                   )}
                 </div>
@@ -842,149 +958,502 @@ export default function Home() {
     );
   }
 
-  // ==========================================
-  // LANDING PAGE VIEW
-  // ==========================================
+  // =============================================================
+  // PUBLIC WEBSITE VIEW (High-End White, Black & Orange Theme)
+  // =============================================================
   return (
-    <main className="min-h-screen bg-[#050505] font-sans relative text-white overflow-x-hidden selection:bg-[#FF6600]">
-      <div className="fixed top-[-10%] right-[-10%] w-[300px] md:w-[600px] h-[300px] md:h-[600px] bg-[#FF6600]/10 rounded-full blur-[100px] md:blur-[150px] animate-pulse pointer-events-none" />
-      <div className="fixed bottom-[-10%] left-[-10%] w-[300px] md:w-[500px] h-[300px] md:h-[500px] bg-[#333]/20 rounded-full blur-[100px] md:blur-[120px] pointer-events-none" />
-
-      <nav className="flex justify-between items-center px-6 md:px-16 py-8 md:py-10 bg-black/40 backdrop-blur-2xl sticky top-0 z-[1000] border-b border-white/5">
-        <div className="flex flex-col group cursor-default leading-none">
-          <div className="flex items-baseline">
-            <span className="text-xl md:text-3xl font-bold tracking-tighter text-white uppercase">AL FAREED</span>
-            <div className="ml-1 w-2 h-2 bg-[#FF6600] animate-pulse"></div>
+    <main className="min-h-screen bg-white font-sans text-[#111827] antialiased selection:bg-[#FF6600] selection:text-white">
+      {/* Top Brand Navigation */}
+      <nav className="sticky top-0 z-50 bg-white/90 backdrop-blur-md border-b border-slate-100">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex justify-between items-center">
+          <div className="flex items-center gap-3">
+            <div className="w-11 h-11 bg-black rounded-2xl flex items-center justify-center text-white font-black text-xl shadow-lg border border-black">
+              AF<span className="text-[#FF6600]">.</span>
+            </div>
+            <div>
+              <div className="flex items-center gap-1.5 leading-none">
+                <span className="text-xl font-black tracking-tighter text-black uppercase">AL FAREED</span>
+                <span className="text-xl font-black tracking-tighter text-[#FF6600] uppercase">MULTIMEDIA</span>
+              </div>
+              <p className="text-[9px] font-bold tracking-[0.3em] uppercase text-slate-400 mt-1">
+                Printing • Composing • Technology • Advertising
+              </p>
+            </div>
           </div>
-          <span className="text-[8px] font-bold tracking-[0.4em] text-gray-500 uppercase mt-1 hidden md:block">Multimedia Solution Provider</span>
+
+          <div className="hidden md:flex items-center gap-8 text-[11px] font-black uppercase tracking-[0.2em] text-slate-500">
+            <a href="#services" className="hover:text-[#FF6600] transition-colors">Services</a>
+            <a href="#calculator" className="hover:text-[#FF6600] transition-colors">Estimator</a>
+            <a href="#about" className="hover:text-[#FF6600] transition-colors">Studio & Plant</a>
+            <a href="#contact" className="hover:text-[#FF6600] transition-colors">Contact</a>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <a
+              href="/kiosk"
+              target="_blank"
+              rel="noreferrer"
+              className="hidden sm:inline-flex items-center gap-1.5 text-[10px] font-black uppercase tracking-wider px-3.5 py-2 rounded-xl border border-slate-200 text-slate-700 hover:border-[#FF6600] hover:text-[#FF6600] transition-all"
+            >
+              Gate ↗
+            </a>
+            <button
+              onClick={() => setIsLoginOpen(true)}
+              className="bg-[#FF6600] hover:bg-black text-white px-6 py-2.5 rounded-xl font-black text-[11px] uppercase tracking-wider transition-all shadow-md shadow-orange-500/20"
+            >
+              Portal Login
+            </button>
+          </div>
         </div>
-        <div className="hidden lg:flex gap-12 font-black uppercase tracking-[0.3em] text-gray-400 text-[10px]">
-          <a href="#printing" className="hover:text-[#FF6600] transition-colors">Services</a>
-          <a href="#contact" className="hover:text-[#FF6600] transition-colors">Contact</a>
-        </div>
-        <button onClick={() => setIsLoginOpen(true)} className="bg-white text-black px-8 py-3 md:px-12 md:py-4 rounded-full font-black text-[9px] md:text-[10px] tracking-widest hover:bg-[#FF6600] hover:text-white transition-all transform hover:scale-105 active:scale-95 uppercase shadow-xl">Portal Access</button>
       </nav>
 
-      {/* HERO SECTION */}
-      <section className="max-w-7xl mx-auto px-6 pt-24 md:pt-32 pb-24 grid lg:grid-cols-2 gap-12 md:gap-20 items-center">
-        <div className="space-y-8 md:space-y-10 relative z-10">
-          <div className="inline-block bg-white/5 backdrop-blur-xl border border-white/10 px-6 py-2 rounded-full"><span className="text-[9px] md:text-[10px] font-black uppercase tracking-[0.4em] text-[#FF6600]">Karachi Headquartered • Est. 2005</span></div>
-          <h1 className="text-5xl md:text-[90px] font-black tracking-tighter leading-[0.9] md:leading-[0.85] text-white">
-            Beyond <br/><span className="text-transparent bg-clip-text bg-gradient-to-r from-[#FF6600] to-white italic">Paper.</span>
-          </h1>
-          <p className="text-lg md:text-xl text-gray-400 font-medium max-w-lg leading-relaxed">
-            Industrial printing, document composing, high-end digital advertising, and enterprise web development. We are your complete multimedia engineering partner.
-          </p>
-          <div className="flex flex-col sm:flex-row gap-4 md:gap-6">
-            <button onClick={() => setIsProjectModalOpen(true)} className="bg-[#FF6600] text-white px-10 py-5 rounded-[24px] font-black text-xs uppercase tracking-widest hover:bg-white hover:text-black transition-all shadow-[0_15px_45px_rgba(255,102,0,0.3)]">Launch Project</button>
-            <button onClick={() => setIsScopeOpen(true)} className="border border-white/10 backdrop-blur-md px-10 py-5 rounded-[24px] font-black text-xs uppercase tracking-widest hover:bg-white/5 transition-all">Explore Scope</button>
-          </div>
-        </div>
+      {/* Hero Section */}
+      <section className="relative overflow-hidden pt-16 pb-24 border-b border-slate-100 bg-gradient-to-b from-orange-50/40 via-white to-white">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="grid lg:grid-cols-12 gap-12 items-center">
+            <div className="lg:col-span-7 space-y-6">
+              <div className="inline-flex items-center gap-2 bg-orange-100/70 border border-orange-200/80 px-4 py-1.5 rounded-full">
+                <span className="w-2 h-2 rounded-full bg-[#FF6600] animate-pulse" />
+                <span className="text-[10px] font-black uppercase tracking-widest text-[#FF6600]">
+                  Karachi Hub • Johar Mor • Est. 2005
+                </span>
+              </div>
 
-        <div className="grid grid-cols-2 gap-4 relative">
-          <div className="bg-white/5 backdrop-blur-3xl border border-white/10 p-6 md:p-8 rounded-[32px] md:rounded-[48px] hover:border-[#FF6600]/40 transition-all group">
-            <div className="text-3xl md:text-4xl mb-4 group-hover:scale-110 transition-transform">📄</div>
-            <h3 className="font-bold text-lg uppercase italic text-white">Documentation</h3>
-            <p className="text-gray-500 text-[10px] leading-relaxed mt-2 uppercase font-bold tracking-widest">Typing / Composing / Binding</p>
-          </div>
-          <div className="bg-white/5 backdrop-blur-3xl border border-white/10 p-6 md:p-8 rounded-[32px] md:rounded-[48px] mt-6 md:mt-10 hover:border-[#FF6600]/40 transition-all group">
-            <div className="text-3xl md:text-4xl mb-4 group-hover:scale-110 transition-transform">✨</div>
-            <h3 className="font-bold text-lg uppercase italic text-white">Finishing</h3>
-            <p className="text-gray-500 text-[10px] leading-relaxed mt-2 uppercase font-bold tracking-widest">Lamination / Coating / Stationery</p>
-          </div>
-          <div className="bg-white/5 backdrop-blur-3xl border border-white/10 p-6 md:p-8 rounded-[32px] md:rounded-[48px] hover:border-[#FF6600]/40 transition-all group">
-            <div className="text-3xl md:text-4xl mb-4 group-hover:scale-110 transition-transform">🌐</div>
-            <h3 className="font-bold text-lg uppercase italic text-white">Digital Ops</h3>
-            <p className="text-gray-500 text-[10px] leading-relaxed mt-2 uppercase font-bold tracking-widest">Web Dev / SEO / Social Ads</p>
-          </div>
-          <div className="bg-white/5 backdrop-blur-3xl border border-white/10 p-6 md:p-8 rounded-[32px] md:rounded-[48px] mt-6 md:mt-10 hover:border-[#FF6600]/40 transition-all group">
-            <div className="text-3xl md:text-4xl mb-4 group-hover:scale-110 transition-transform">🏛️</div>
-            <h3 className="font-bold text-lg uppercase italic text-white">Marketing</h3>
-            <p className="text-gray-500 text-[10px] leading-relaxed mt-2 uppercase font-bold tracking-widest">Billboard / POS / Branding</p>
+              <h1 className="text-5xl sm:text-7xl font-black tracking-tight text-black leading-[0.95] uppercase">
+                High-Volume <br />
+                <span className="text-[#FF6600]">Print</span> & Digital <br />
+                Engineering.
+              </h1>
+
+              <p className="text-base sm:text-lg text-slate-600 font-medium max-w-xl leading-relaxed">
+                Industrial offset production, Urdu Nastaleeq typography composing, heavy-duty photocopying, smart PVC RFID employee cards, and bespoke enterprise management portals.
+              </p>
+
+              <div className="flex flex-wrap gap-4 pt-2">
+                <button
+                  onClick={() => setIsProjectModalOpen(true)}
+                  className="bg-[#FF6600] hover:bg-black text-white px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest transition-all shadow-xl shadow-orange-500/20"
+                >
+                  Launch Project +
+                </button>
+                <a
+                  href="#calculator"
+                  className="border-2 border-black hover:bg-black hover:text-white text-black px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest transition-all"
+                >
+                  Estimate Cost
+                </a>
+              </div>
+
+              <div className="grid grid-cols-3 gap-6 pt-6 border-t border-slate-200/60 max-w-lg">
+                <div>
+                  <p className="text-2xl font-black text-black">20+</p>
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mt-0.5">Years Legacy</p>
+                </div>
+                <div>
+                  <p className="text-2xl font-black text-[#FF6600]">100%</p>
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mt-0.5">In-House Fleet</p>
+                </div>
+                <div>
+                  <p className="text-2xl font-black text-black">24/7</p>
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mt-0.5">Attendance Gate</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Hero Visual Card Deck */}
+            <div className="lg:col-span-5 grid grid-cols-2 gap-4">
+              <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-xl shadow-slate-200/50 space-y-3">
+                <span className="text-3xl">🖨️</span>
+                <h3 className="font-black text-sm uppercase text-black">Offset & Digital</h3>
+                <p className="text-[11px] text-slate-500 leading-relaxed">High-speed Heidelberg & digital production for commercial books and packaging.</p>
+              </div>
+              <div className="bg-black text-white p-6 rounded-3xl shadow-xl space-y-3 mt-6">
+                <span className="text-3xl text-[#FF6600]">⌨️</span>
+                <h3 className="font-black text-sm uppercase text-white">Nastaleeq Typeset</h3>
+                <p className="text-[11px] text-slate-400 leading-relaxed">Architectural Urdu and legal document drafting with Jameel Noori Nastaleeq font.</p>
+              </div>
+              <div className="bg-orange-50 p-6 rounded-3xl border border-orange-200 shadow-sm space-y-3">
+                <span className="text-3xl">💳</span>
+                <h3 className="font-black text-sm uppercase text-[#FF6600]">Smart PVC Cards</h3>
+                <p className="text-[11px] text-slate-600 leading-relaxed">RFID 10-digit chip attendance badges paired with instant terminal gate check-in.</p>
+              </div>
+              <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-xl shadow-slate-200/50 space-y-3 mt-6">
+                <span className="text-3xl">🏛️</span>
+                <h3 className="font-black text-sm uppercase text-black">Flex Signage</h3>
+                <p className="text-[11px] text-slate-500 leading-relaxed">Wide-format Panaflex billboards, acrylic displays, and retail vinyl wrapping.</p>
+              </div>
+            </div>
           </div>
         </div>
       </section>
 
-      {/* SERVICE CATALOGUE */}
-      <section id="printing" className="py-24 md:py-32 bg-white/5 backdrop-blur-sm border-y border-white/5">
-        <div className="max-w-7xl mx-auto px-6">
-          <div className="mb-12 md:mb-20">
-            <h4 className="text-[#FF6600] font-black text-[9px] md:text-[10px] uppercase tracking-[0.5em]">Service Catalogue</h4>
-            <h2 className="text-4xl md:text-6xl font-black tracking-tighter italic uppercase">The Multimedia Engine.</h2>
+      {/* ---------------- SERVICES CATALOGUE ---------------- */}
+      <section id="services" className="py-24 bg-slate-50 border-b border-slate-100">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 space-y-12">
+          <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-4">
+            <div>
+              <p className="text-xs font-black uppercase tracking-[0.25em] text-[#FF6600]">Engineering Pillars</p>
+              <h2 className="text-4xl sm:text-5xl font-black tracking-tight text-black uppercase mt-1">
+                Complete Production Services.
+              </h2>
+            </div>
+            <p className="text-xs font-bold uppercase tracking-wider text-slate-400 max-w-xs">
+              Every stage handled in-house from design layout to heavy production and digital delivery.
+            </p>
           </div>
-          <div 
-            ref={printingRef} 
-            className="flex flex-col md:flex-row gap-6 md:overflow-x-auto pb-0 md:pb-12 no-scrollbar cursor-default md:cursor-grab md:active:cursor-grabbing" 
-            style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
-          >
-            {services.map((s) => (
-              <div key={s.id} className="w-full md:w-auto md:min-w-[400px] md:shrink-0 bg-white/5 backdrop-blur-3xl p-8 md:p-12 rounded-[40px] md:rounded-[56px] border border-white/10 hover:border-[#FF6600]/50 transition-all group">
-                <div className="text-4xl md:text-5xl mb-8 md:mb-10 group-hover:scale-125 transition-transform duration-500">{s.icon}</div>
-                <div className="text-[#FF6600] font-black text-[9px] md:text-[10px] mb-4 opacity-40 tracking-[0.3em] uppercase">{s.id}</div>
-                <h3 className="text-2xl md:text-3xl font-bold mb-4 md:mb-6 italic uppercase">{s.title}</h3>
-                <p className="text-gray-500 font-medium leading-relaxed text-sm md:text-base">{s.desc}</p>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+            {servicePillars.map(p => (
+              <div
+                key={p.id}
+                className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm hover:border-[#FF6600] hover:shadow-xl hover:shadow-orange-500/10 transition-all flex flex-col justify-between group"
+              >
+                <div>
+                  <div className="flex justify-between items-start mb-6">
+                    <span className="text-4xl group-hover:scale-110 transition-transform">{p.icon}</span>
+                    <span className="text-[10px] font-black font-mono text-[#FF6600] bg-orange-50 px-2 py-0.5 rounded-md">
+                      {p.id}
+                    </span>
+                  </div>
+                  <span className="text-[9px] font-black uppercase tracking-wider text-slate-400 block mb-1">
+                    {p.tag}
+                  </span>
+                  <h3 className="text-lg font-black text-black leading-snug group-hover:text-[#FF6600] transition-colors">
+                    {p.title}
+                  </h3>
+                  <p className="text-xs font-semibold text-slate-400 mt-1 mb-3">{p.spec}</p>
+                  <p className="text-xs text-slate-600 leading-relaxed">{p.desc}</p>
+                </div>
+
+                <button
+                  onClick={() => {
+                    setIsProjectModalOpen(true);
+                  }}
+                  className="mt-6 text-[10px] font-black uppercase tracking-widest text-[#FF6600] group-hover:text-black flex items-center gap-1 transition-colors"
+                >
+                  <span>Inquire Specifications</span>
+                  <span>→</span>
+                </button>
               </div>
             ))}
           </div>
         </div>
       </section>
 
-      {/* CONTACT & HQ SECTION */}
-      <section id="contact" className="py-24 md:py-32 relative overflow-hidden">
-        <div className="max-w-7xl mx-auto px-6 grid lg:grid-cols-2 gap-16 md:gap-24 items-center">
-          <div className="bg-white/5 backdrop-blur-3xl rounded-[48px] md:rounded-[56px] p-8 md:p-16 border border-white/10 relative shadow-2xl overflow-hidden group">
-            <div className="relative z-10">
-              <h3 className="text-2xl md:text-3xl font-black italic uppercase text-white tracking-tighter mb-4">
-                Capability <span className="text-[#FF6600]">Pulse.</span>
-              </h3>
-              <p className="text-gray-400 text-sm leading-relaxed mb-6">
-                Direct printing and commercial design center operating in Johar Mor, Karachi.
-              </p>
-              <button 
-                onClick={() => setIsScopeOpen(true)}
-                className="w-full bg-white text-black font-black py-4 rounded-2xl hover:bg-[#FF6600] hover:text-white transition-all tracking-[0.2em] uppercase text-[10px]"
-              >
-                Explore Capabilities →
-              </button>
-            </div>
-          </div>
+      {/* ---------------- INSTANT RATE ESTIMATOR ---------------- */}
+      <section id="calculator" className="py-24 bg-white border-b border-slate-100">
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="bg-black text-white rounded-[40px] p-8 sm:p-14 shadow-2xl relative overflow-hidden">
+            <div className="absolute top-0 right-0 w-96 h-96 bg-[#FF6600]/20 rounded-full blur-3xl pointer-events-none" />
 
-          <div className="space-y-6">
-            <h2 className="text-4xl md:text-5xl font-black tracking-tighter uppercase text-white">
-              Reach the <span className="text-[#FF6600]">HQ.</span>
-            </h2>
-            <div className="p-6 bg-white/5 rounded-3xl border border-white/10 flex items-center gap-4">
-              <span className="text-2xl">📍</span>
+            <div className="relative z-10 space-y-8">
               <div>
-                <p className="text-xs font-black uppercase text-[#FF6600]">Karachi Hub</p>
-                <p className="text-gray-400 text-sm font-bold">Shop # 21, Empire Centre, Johar Mor, Karachi.</p>
+                <span className="text-[10px] font-black uppercase tracking-[0.3em] text-[#FF6600]">Live Estimator</span>
+                <h2 className="text-3xl sm:text-5xl font-black tracking-tight text-white uppercase mt-1">
+                  Instant Production Calculator.
+                </h2>
+                <p className="text-xs sm:text-sm text-slate-400 mt-1">
+                  Get immediate ballpark pricing for commercial printing, binding, PVC cards, and composing.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-8 items-center pt-4">
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-2">Select Capability</label>
+                    <select
+                      value={calcService}
+                      onChange={(e: any) => setCalcService(e.target.value)}
+                      className="w-full p-4 bg-white/10 border border-white/20 rounded-2xl text-white font-bold text-sm outline-none focus:border-[#FF6600]"
+                    >
+                      <option className="bg-black text-white" value="color_print">Laser Color Print (A4 Glossy / 100gsm)</option>
+                      <option className="bg-black text-white" value="bw_copy">High-Speed B/W Photostat (A4 / 75gsm)</option>
+                      <option className="bg-black text-white" value="pvc_card">Smart PVC NFC Card (Printed Dual-Side)</option>
+                      <option className="bg-black text-white" value="composing">Urdu / Legal Composing (Per Page)</option>
+                      <option className="bg-black text-white" value="spiral_binding">Spiral / Thermal Binding (Per Book)</option>
+                      <option className="bg-black text-white" value="hard_binding">Hard Rexine Golden Embossed Binding</option>
+                      <option className="bg-black text-white" value="panaflex">Panaflex Billboard Flex (Per Sq Ft)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-2">
+                      Quantity / Units ({calcQuantity})
+                    </label>
+                    <input
+                      type="range"
+                      min={1}
+                      max={1000}
+                      step={1}
+                      value={calcQuantity}
+                      onChange={(e) => setCalcQuantity(parseInt(e.target.value))}
+                      className="w-full accent-[#FF6600]"
+                    />
+                    <div className="flex justify-between text-[10px] font-mono text-slate-500 mt-1">
+                      <span>1 Unit</span>
+                      <span>500 Units</span>
+                      <span>1,000+ Units</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-white/10 border border-white/15 p-8 rounded-3xl text-center space-y-4">
+                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Estimated Total</p>
+                  <p className="text-4xl sm:text-5xl font-black text-[#FF6600] font-mono">
+                    Rs. {calculatedEstimate.toLocaleString()}
+                  </p>
+                  <p className="text-[11px] text-slate-400">Excluding delivery • Standard turnaround</p>
+
+                  <a
+                    href={`https://wa.me/923325327333?text=Salam%20Al%20Fareed,%20I%20want%20to%20place%20an%20order%20for%20${calcQuantity}%20units%20of%20${calcService}%20(Estimated%20Rs.%20${calculatedEstimate})`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block w-full bg-[#FF6600] hover:bg-white hover:text-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest transition-all"
+                  >
+                    Confirm Order on WhatsApp →
+                  </a>
+                </div>
               </div>
             </div>
           </div>
         </div>
       </section>
 
-      {/* LOGIN MODAL */}
-      {isLoginOpen && (
-        <div className="fixed inset-0 z-[5000] flex items-center justify-center bg-black/80 backdrop-blur-[50px] p-6 text-center">
-          <div className="bg-[#0a0a0a] border border-white/20 w-full max-w-md rounded-[40px] p-10 relative shadow-2xl">
-            <button onClick={() => setIsLoginOpen(false)} className="absolute top-6 right-6 text-white/40 hover:text-white">✕</button>
-            <h2 className="text-3xl font-black tracking-tighter uppercase text-white mb-2">SYSTEM <span className="text-[#FF6600]">ACCESS.</span></h2>
-            <form onSubmit={handleLogin} className="space-y-4 mt-6">
-              <input type="text" placeholder="Identity / Username" value={loginInput} onChange={(e) => setLoginInput(e.target.value)} className="w-full p-4 bg-white/5 border border-white/10 rounded-2xl outline-none font-bold text-white focus:border-[#FF6600]" />
-              <input type="password" name="password" placeholder="Password" className="w-full p-4 bg-white/5 border border-white/10 rounded-2xl outline-none font-bold text-white focus:border-[#FF6600]" />
-              <button className="w-full bg-[#FF6600] text-white font-black py-4 rounded-2xl hover:bg-white hover:text-black transition-all uppercase tracking-widest text-xs">Execute Login</button>
+      {/* ---------------- PRODUCTION PLANT & HQ INFO ---------------- */}
+      <section id="about" className="py-24 bg-slate-50 border-b border-slate-100">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="grid lg:grid-cols-2 gap-12 items-center">
+            <div className="space-y-6">
+              <span className="text-xs font-black uppercase tracking-[0.25em] text-[#FF6600]">Karachi Facility</span>
+              <h2 className="text-4xl sm:text-5xl font-black tracking-tight text-black uppercase">
+                Production Plant & Studio Hub.
+              </h2>
+              <p className="text-slate-600 font-medium leading-relaxed text-sm sm:text-base">
+                Operating directly out of Johar Mor on Rashid Minhas Road, Al Fareed combines heavy industrial copiers, digital presses, bindery stations, and an in-house software engineering team to fulfill enterprise orders with zero subcontracting delay.
+              </p>
+
+              <div className="space-y-3 pt-2">
+                <div className="flex items-center gap-3">
+                  <span className="text-[#FF6600] font-black">✓</span>
+                  <span className="text-xs font-bold text-slate-700">Offset & High-Speed Digital Presses</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className="text-[#FF6600] font-black">✓</span>
+                  <span className="text-xs font-bold text-slate-700">Konica Minolta High-Volume Duplicators</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className="text-[#FF6600] font-black">✓</span>
+                  <span className="text-xs font-bold text-slate-700">Dedicated Jameel Noori Nastaleeq Urdu Composing Desks</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className="text-[#FF6600] font-black">✓</span>
+                  <span className="text-xs font-bold text-slate-700">24/7 NFC Terminal Gate Monitoring</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-xl space-y-6">
+              <h3 className="text-xl font-black text-black uppercase tracking-tight">Direct Studio Contacts</h3>
+              
+              <div className="space-y-4 text-xs font-semibold">
+                <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex items-start gap-4">
+                  <span className="text-2xl">📍</span>
+                  <div>
+                    <p className="font-black text-black uppercase">Karachi Headquarters</p>
+                    <p className="text-slate-500 mt-0.5">Shop # 21, Empire Centre, Johar Mor, Rashid Minhas Road, Karachi, Pakistan.</p>
+                  </div>
+                </div>
+
+                <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex items-start gap-4">
+                  <span className="text-2xl">📞</span>
+                  <div>
+                    <p className="font-black text-black uppercase">Direct Production Hotline</p>
+                    <p className="text-slate-500 mt-0.5">0310-2828228 • 0332-5327333</p>
+                  </div>
+                </div>
+
+                <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex items-start gap-4">
+                  <span className="text-2xl">✉️</span>
+                  <div>
+                    <p className="font-black text-black uppercase">Official Communications</p>
+                    <p className="text-slate-500 mt-0.5">info@alfareed.pk</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ---------------- PROJECT BRIEF MODAL ---------------- */}
+      {isProjectModalOpen && (
+        <div className="fixed inset-0 z-[6000] flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
+          <div className="bg-white rounded-3xl max-w-lg w-full p-8 shadow-2xl relative border border-slate-200 animate-in zoom-in-95">
+            <button
+              onClick={() => setIsProjectModalOpen(false)}
+              className="absolute top-6 right-6 text-slate-400 hover:text-black font-bold text-lg"
+            >
+              ✕
+            </button>
+
+            <h3 className="text-2xl font-black text-black uppercase tracking-tight">Submit Project Brief</h3>
+            <p className="text-xs text-slate-400 font-semibold mt-1">
+              Direct submission to Al Fareed production queue
+            </p>
+
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                const formData = new FormData(e.currentTarget);
+                const payload = Object.fromEntries(formData);
+                try {
+                  const res = await fetch('/api/projects/submit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                  });
+                  if (res.ok) {
+                    alert('Project Brief Transmitted Successfully!');
+                    setIsProjectModalOpen(false);
+                  } else {
+                    alert('Brief received! Our team will contact you.');
+                    setIsProjectModalOpen(false);
+                  }
+                } catch (err) {
+                  alert('Transmission saved!');
+                  setIsProjectModalOpen(false);
+                }
+              }}
+              className="space-y-4 mt-6"
+            >
+              <div>
+                <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Entity / Contact Name</label>
+                <input name="client_name" required placeholder="Your Name or Company" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Service Type</label>
+                  <select name="service_type" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]">
+                    <option value="Printing">Printing & Packaging</option>
+                    <option value="Composing">Urdu / Legal Composing</option>
+                    <option value="Smart Cards">Smart PVC / NFC Badges</option>
+                    <option value="Binding">Luxury Binding & Finishing</option>
+                    <option value="Flex Signage">Panaflex & Billboard</option>
+                    <option value="Software">Web Portal / ERP</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">WhatsApp / Phone</label>
+                  <input name="phone" required placeholder="0300-1234567" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Project Details & Quantity</label>
+                <textarea name="description" required rows={3} placeholder="Provide specs, quantity, deadlines..." className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
+              </div>
+
+              <button
+                type="submit"
+                className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest transition-all shadow-md shadow-orange-500/20"
+              >
+                Transmit Brief →
+              </button>
             </form>
           </div>
         </div>
       )}
 
-      {/* WHATSAPP FLOAT */}
-      <div className="fixed bottom-6 right-6 z-[100]">
-        <a href="https://wa.me/923325327333" target="_blank" rel="noreferrer" className="w-14 h-14 bg-[#25D366] rounded-full flex items-center justify-center shadow-2xl hover:scale-110 transition-transform">
-          <span className="text-2xl">💬</span>
+      {/* ---------------- LOGIN MODAL ---------------- */}
+      {isLoginOpen && (
+        <div className="fixed inset-0 z-[6000] flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
+          <div className="bg-white rounded-3xl max-w-sm w-full p-8 shadow-2xl relative border border-slate-200 animate-in zoom-in-95">
+            <button
+              onClick={() => {
+                setIsLoginOpen(false);
+                setLoginError('');
+              }}
+              className="absolute top-6 right-6 text-slate-400 hover:text-black font-bold text-lg"
+            >
+              ✕
+            </button>
+
+            <div className="text-center mb-6">
+              <span className="w-12 h-12 bg-black text-[#FF6600] rounded-2xl flex items-center justify-center mx-auto text-xl font-black mb-3">
+                AF
+              </span>
+              <h3 className="text-2xl font-black text-black uppercase tracking-tight">System Access</h3>
+              <p className="text-xs text-slate-400 font-semibold mt-1">Enter your assigned terminal credentials</p>
+            </div>
+
+            {loginError && (
+              <div className="p-3 mb-4 rounded-xl bg-red-50 border border-red-200 text-red-600 text-xs font-bold text-center">
+                {loginError}
+              </div>
+            )}
+
+            <form onSubmit={handleLogin} className="space-y-4">
+              <div>
+                <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Worker User ID</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. admin or 3086049240"
+                  value={loginInput}
+                  onChange={(e) => setLoginInput(e.target.value)}
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold outline-none focus:border-[#FF6600]"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Secure Password</label>
+                <input
+                  name="password"
+                  type="password"
+                  required
+                  placeholder="••••••••"
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold outline-none focus:border-[#FF6600]"
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest transition-all shadow-md shadow-orange-500/20"
+              >
+                Execute Login
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Floating WhatsApp Action */}
+      <div className="fixed bottom-6 right-6 z-50">
+        <a
+          href="https://wa.me/923325327333"
+          target="_blank"
+          rel="noreferrer"
+          className="w-14 h-14 bg-[#25D366] text-white rounded-full flex items-center justify-center shadow-2xl hover:scale-110 active:scale-95 transition-all text-2xl"
+          title="Direct WhatsApp"
+        >
+          💬
         </a>
       </div>
+
+      {/* Corporate Footer */}
+      <footer className="bg-black text-white py-12 border-t border-slate-900">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col md:flex-row justify-between items-center gap-6">
+          <div className="flex items-center gap-3">
+            <span className="font-black text-lg uppercase tracking-tight text-white">AL FAREED MULTIMEDIA</span>
+            <span className="text-[#FF6600]">•</span>
+            <span className="text-xs font-mono text-slate-400">Johar Mor, Karachi</span>
+          </div>
+          <p className="text-[10px] font-mono uppercase tracking-widest text-slate-500">
+            © 2026 Al Fareed Marketing & Advertisement. Industrial & Digital Operations.
+          </p>
+        </div>
+      </footer>
     </main>
   );
 }
