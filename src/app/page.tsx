@@ -185,23 +185,24 @@ export default function Home() {
 
     window.addEventListener('keydown', handleKeyDown);
 
-    let abortCtrl: AbortController | null = null;
+// 2. Mobile Android Chrome (Web NFC listener)
+    let ndef: any = null;
+    let abortController: AbortController | null = null;
     if (typeof window !== 'undefined' && 'NDEFReader' in window) {
       try {
-        abortCtrl = new AbortController();
-        const ndef = new (window as any).NDEFReader();
-        ndef.scan({ signal: abortCtrl.signal }).then(() => {
+        abortController = new AbortController();
+        ndef = new (window as any).NDEFReader();
+        ndef.scan({ signal: abortController.signal }).then(() => {
           ndef.onreading = (event: any) => {
-          if (!event.serialNumber) return;
+            if (!event.serialNumber) return;
 
-          const hexParts = event.serialNumber.split(':');
-          const first4 = hexParts.slice(0, 4);
-          const littleEndianHex = [...first4].reverse().join('');
-          const decValue = parseInt(littleEndianHex, 16);
-          const unifiedCardId = String(decValue).padStart(10, '0');
+            const hexParts = event.serialNumber.split(':');
+            const first4 = hexParts.slice(0, 4);
+            const littleEndianHex = [...first4].reverse().join('');
+            const decValue = parseInt(littleEndianHex, 16);
+            const unifiedCardId = String(decValue).padStart(10, '0');
 
-          processCardId(unifiedCardId);
-        };
+            processCardId(unifiedCardId);
           };
         }).catch(() => {});
       } catch (err) {}
