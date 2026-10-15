@@ -192,11 +192,16 @@ export default function Home() {
         const ndef = new (window as any).NDEFReader();
         ndef.scan({ signal: abortCtrl.signal }).then(() => {
           ndef.onreading = (event: any) => {
-            if (event.serialNumber) {
-              const hex = event.serialNumber.split(':').join('');
-              const dec = parseInt(hex, 16);
-              if (!isNaN(dec)) processScannedCard(String(dec).padStart(10, '0'));
-            }
+          if (!event.serialNumber) return;
+
+          const hexParts = event.serialNumber.split(':');
+          const first4 = hexParts.slice(0, 4);
+          const littleEndianHex = [...first4].reverse().join('');
+          const decValue = parseInt(littleEndianHex, 16);
+          const unifiedCardId = String(decValue).padStart(10, '0');
+
+          processCardId(unifiedCardId);
+        };
           };
         }).catch(() => {});
       } catch (err) {}
