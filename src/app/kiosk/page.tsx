@@ -275,22 +275,22 @@ export default function KioskPage() {
       ndef.onreading = (event: any) => {
         if (!event.serialNumber) return;
 
-        // Extract UID bytes
+        // Split hex UID bytes (works for both 4-byte and 7-byte cards)
         const hexParts = event.serialNumber.split(':');
         
-        // Format A: Standard Big-Endian Decimal
-        const hexBig = hexParts.join('');
-        const decBig = parseInt(hexBig, 16);
-        const cardIdBig = String(decBig).padStart(10, '0');
+        // Take the first 4 bytes to match standard USB keyboard wedge output
+        const first4 = hexParts.slice(0, 4);
+        
+        // Reverse bytes to Little-Endian 32-bit integer
+        const littleEndianHex = [...first4].reverse().join('');
+        
+        // Parse to decimal and pad to 10 digits
+        const decValue = parseInt(littleEndianHex, 16);
+        const unifiedCardId = String(decValue).padStart(10, '0');
 
-        // Format B: Little-Endian Decimal (Matches standard USB IC Readers)
-        const hexLittle = [...hexParts].reverse().join('');
-        const decLittle = parseInt(hexLittle, 16);
-        const cardIdLittle = String(decLittle).padStart(10, '0');
-
-        // Pass format to backend processor
-        processCardScan(cardIdBig.length === 10 ? cardIdBig : cardIdLittle);
+        processCardScan(unifiedCardId);
       };
+      
     } catch (err: any) {
       console.error('NFC Scan Activation Error:', err);
       setNfcActive(false);
