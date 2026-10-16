@@ -40,12 +40,29 @@ interface ProjectBrief {
 }
 
 interface WorkerWageConfig {
+  pay_basis: 'monthly' | 'daily' | 'hourly';
   shift_start: string; // e.g. "10:00"
   shift_end: string;   // e.g. "20:00"
   monthly_salary: number; // in PKR
+  daily_wage: number;
+  hourly_rate: number;
   working_days: number;   // default 26
   ot_multiplier: number;  // default 1.5x
   grace_period_mins: number; // default 15
+}
+
+// Helper to normalize any date string to YYYY-MM-DD for calendar comparison
+function normalizeDate(dateStr: string): string {
+  if (!dateStr) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+  const parsed = new Date(dateStr);
+  if (!isNaN(parsed.getTime())) {
+    const y = parsed.getFullYear();
+    const m = String(parsed.getMonth() + 1).padStart(2, '0');
+    const d = String(parsed.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+  return dateStr.substring(0, 10);
 }
 
 export default function Home() {
@@ -64,6 +81,11 @@ export default function Home() {
   const [attendanceSearch, setAttendanceSearch] = useState('');
   const [isRefreshing, setIsRefreshing] = useState(false);
 
+  // Manual Punch Modal State for Admin
+  const [isManualPunchOpen, setIsManualPunchOpen] = useState(false);
+  const [manualWorkerId, setManualWorkerId] = useState('');
+  const [manualAction, setManualAction] = useState<'in' | 'out'>('in');
+
   // Calendar View State
   const [selectedCalendarDate, setSelectedCalendarDate] = useState<string>(() => {
     return new Date().toISOString().split('T')[0];
@@ -74,9 +96,12 @@ export default function Home() {
   const [wageProfiles, setWageProfiles] = useState<Record<string, WorkerWageConfig>>({});
   const [editingWageWorker, setEditingWageWorker] = useState<TeamMember | null>(null);
   const [wageFormState, setWageFormState] = useState<WorkerWageConfig>({
+    pay_basis: 'monthly',
     shift_start: '10:00',
     shift_end: '20:00',
     monthly_salary: 35000,
+    daily_wage: 1346,
+    hourly_rate: 135,
     working_days: 26,
     ot_multiplier: 1.5,
     grace_period_mins: 15
@@ -91,13 +116,15 @@ export default function Home() {
     type: 'idle'
   });
 
+  // Worker Dashboard Filtering State
+  const [workerHistoryRange, setWorkerHistoryRange] = useState<'all' | 'month' | 'custom'>('all');
+  const [workerCustomStart, setWorkerCustomStart] = useState('');
+  const [workerCustomEnd, setWorkerCustomEnd] = useState('');
+
   // Public Landing Page Modals & Calculator
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
-  const [isScopeOpen, setIsScopeOpen] = useState(false);
   const [calcService, setCalcService] = useState<'bw_copy' | 'color_print' | 'pvc_card' | 'composing' | 'spiral_binding' | 'hard_binding' | 'panaflex'>('color_print');
   const [calcQuantity, setCalcQuantity] = useState<number>(50);
-
-  const printingRef = useRef<HTMLDivElement>(null);
 
   // -------------------------------------------------------------
   // SESSION & WAGE PROFILE PERSISTENCE
@@ -154,7 +181,7 @@ export default function Home() {
   };
 
   useEffect(() => {
-    if (userRole === 'admin') {
+    if (userRole) {
       fetchAllData();
       const interval = setInterval(fetchAllData, 15000);
       return () => clearInterval(interval);
@@ -162,114 +189,49 @@ export default function Home() {
   }, [userRole]);
 
   // -------------------------------------------------------------
-  // NFC ENROLLMENT LISTENER (Keyboard Wedge + Android Web NFC)
-  // -------------------------------------------------------------
-  useEffect(() => {
-    if (!isNfcModalOpen || !selectedWorker) return;
-
-    let buffer = '';
-    let flushTimer: NodeJS.Timeout;
-
-    const processScannedCard = async (scannedId: string) => {
-      const clean = scannedId.replace(/\D/g, '').trim();
-      if (clean.length < 4) return;
-
-      setNfcInput(clean);
-      setNfcStatus({ message: `Card ${clean} detected. Pairing...`, type: 'loading' });
-
-      try {
-        const res = await fetch('/api/users/assign-card', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ userId: selectedWorker.user_id, cardId: clean })
-        });
-        const data = await res.json();
-
-        if (res.ok) {
-          setNfcStatus({ message: `Card ${clean} successfully linked to ${selectedWorker.full_name}!`, type: 'success' });
-          fetchAllData();
-          setTimeout(() => {
-            setIsNfcModalOpen(false);
-            setSelectedWorker(null);
-          }, 1200);
-        } else {
-          setNfcStatus({ message: data.error || 'Failed to save card.', type: 'error' });
-        }
-      } catch (err) {
-        setNfcStatus({ message: 'Network connection failed.', type: 'error' });
-      }
-    };
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Enter' || e.key === 'Tab') {
-        if (buffer.length >= 4) processScannedCard(buffer);
-        buffer = '';
-        clearTimeout(flushTimer);
-        return;
-      }
-      if (/^\d$/.test(e.key)) {
-        buffer += e.key;
-        clearTimeout(flushTimer);
-        flushTimer = setTimeout(() => {
-          if (buffer.length >= 4) processScannedCard(buffer);
-          buffer = '';
-        }, 150);
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-
-    // 2. Mobile Android Chrome (Web NFC listener)
-    let ndef: any = null;
-    let abortController: AbortController | null = null;
-    if (typeof window !== 'undefined' && 'NDEFReader' in window) {
-      try {
-        abortController = new AbortController();
-        ndef = new (window as any).NDEFReader();
-        ndef.scan({ signal: abortController.signal }).then(() => {
-          ndef.onreading = (event: any) => {
-            if (!event.serialNumber) return;
-
-            const hexParts = event.serialNumber.split(':');
-            const first4 = hexParts.slice(0, 4);
-            const littleEndianHex = [...first4].reverse().join('');
-            const decValue = parseInt(littleEndianHex, 16);
-            const unifiedCardId = String(decValue).padStart(10, '0');
-
-            processScannedCard(unifiedCardId);
-          };
-        }).catch(() => {});
-      } catch (err) {}
-    }
-
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      clearTimeout(flushTimer);
-      if (abortController) abortController.abort();
-    };
-  }, [isNfcModalOpen, selectedWorker]);
-
-  // -------------------------------------------------------------
   // WAGE COMPUTATION HELPERS
   // -------------------------------------------------------------
   const getWorkerProfile = (workerId: string): WorkerWageConfig => {
     return wageProfiles[workerId] || {
+      pay_basis: 'monthly',
       shift_start: '10:00',
       shift_end: '20:00',
       monthly_salary: 35000,
+      daily_wage: 1346,
+      hourly_rate: 135,
       working_days: 26,
       ot_multiplier: 1.5,
       grace_period_mins: 15
     };
   };
 
+  const updateWageForm = (updatedFields: Partial<WorkerWageConfig>) => {
+    const current = { ...wageFormState, ...updatedFields };
+    const workingDays = current.working_days || 26;
+
+    if (updatedFields.pay_basis === 'monthly' || ('monthly_salary' in updatedFields && current.pay_basis === 'monthly')) {
+      const daily = Math.round(current.monthly_salary / workingDays);
+      const hourly = Math.round(daily / 10);
+      current.daily_wage = daily;
+      current.hourly_rate = hourly;
+    } else if (updatedFields.pay_basis === 'daily' || ('daily_wage' in updatedFields && current.pay_basis === 'daily')) {
+      const monthly = Math.round(current.daily_wage * workingDays);
+      const hourly = Math.round(current.daily_wage / 10);
+      current.monthly_salary = monthly;
+      current.hourly_rate = hourly;
+    } else if (updatedFields.pay_basis === 'hourly' || ('hourly_rate' in updatedFields && current.pay_basis === 'hourly')) {
+      const daily = Math.round(current.hourly_rate * 10);
+      const monthly = Math.round(daily * workingDays);
+      current.daily_wage = daily;
+      current.monthly_salary = monthly;
+    }
+    setWageFormState(current);
+  };
+
   const calculateShiftMetrics = (workerId: string, clockInStr: string, regHours: number, otHours: number) => {
     const profile = getWorkerProfile(workerId);
-    
-    // Parse scheduled start time (e.g. "10:00")
     const [schedH, schedM] = profile.shift_start.split(':').map(Number);
     
-    // Parse actual clock-in (handles "10:35:12 AM" or "10:35")
     let actualMinutes = 0;
     const timeMatch = clockInStr.match(/(\d+):(\d+)(?::(\d+))?\s*(AM|PM)?/i);
     if (timeMatch) {
@@ -286,20 +248,12 @@ export default function Home() {
     const isLate = diffMinutes > profile.grace_period_mins;
     const lateMins = isLate ? diffMinutes : 0;
 
-    // Financial Rates
-    const dailyWage = Math.round(profile.monthly_salary / profile.working_days);
-    const scheduledHours = 10; // Standard 10 hours
-    const hourlyRate = Math.round(dailyWage / scheduledHours);
+    const hourlyRate = profile.hourly_rate || Math.round((profile.monthly_salary / profile.working_days) / 10);
     const minuteRate = hourlyRate / 60;
     
-    // Late Deduction
     const lateDeduction = isLate ? Math.round(lateMins * minuteRate) : 0;
-    
-    // Overtime Pay
     const otRate = Math.round(hourlyRate * profile.ot_multiplier);
     const otEarned = Math.round(otHours * otRate);
-
-    // Regular Pay for logged hours
     const regEarned = Math.round(regHours * hourlyRate);
     const netDayPay = Math.max(0, regEarned + otEarned - lateDeduction);
 
@@ -307,7 +261,6 @@ export default function Home() {
       profile,
       isLate,
       lateMins,
-      dailyWage,
       hourlyRate,
       otRate,
       lateDeduction,
@@ -340,16 +293,17 @@ export default function Home() {
     return (rates[calcService] || 10) * Math.max(1, calcQuantity);
   }, [calcService, calcQuantity]);
 
-  // Calendar filtered records
+  // Calendar filtered records using normalized date
   const calendarRecords = useMemo(() => {
     return attendanceLogs.filter(log => {
-      const matchesDate = log.date === selectedCalendarDate;
+      const normDate = normalizeDate(log.date);
+      const matchesDate = normDate === selectedCalendarDate;
       const matchesWorker = selectedWorkerFilter === 'ALL' || log.worker_id === selectedWorkerFilter;
       return matchesDate && matchesWorker;
     });
   }, [attendanceLogs, selectedCalendarDate, selectedWorkerFilter]);
 
-  // Overall Payroll & Deductions Summary
+  // Overall Payroll Summary
   const payrollSummary = useMemo(() => {
     return teamMembers.map(member => {
       const logs = attendanceLogs.filter(l => l.worker_id === member.user_id);
@@ -388,7 +342,7 @@ export default function Home() {
   }, [teamMembers, attendanceLogs, wageProfiles]);
 
   // -------------------------------------------------------------
-  // AUTHENTICATION HANDLERS
+  // AUTHENTICATION & MANUAL PUNCH HANDLERS
   // -------------------------------------------------------------
   const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -429,6 +383,45 @@ export default function Home() {
     setUserRole(null);
     setUserData(null);
     localStorage.removeItem('alfareed_session');
+  };
+
+  const handleManualPunchSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!manualWorkerId) return;
+
+    try {
+      if (manualAction === 'in') {
+        const res = await fetch('/api/attendance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ employee_id: manualWorkerId, status: 'Manual Admin Punch' })
+        });
+        if (res.ok) {
+          alert('Member successfully clocked in manually!');
+          setIsManualPunchOpen(false);
+          fetchAllData();
+        } else {
+          const err = await res.json();
+          alert(err.error || 'Failed to clock in');
+        }
+      } else {
+        const res = await fetch('/api/attendance/checkout', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ employee_id: manualWorkerId })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          alert(`Member successfully clocked out! Overtime: ${data.overtime_hrs || 0}h`);
+          setIsManualPunchOpen(false);
+          fetchAllData();
+        } else {
+          alert(data.error || 'Failed to clock out');
+        }
+      }
+    } catch (err) {
+      alert('Network connection error during manual punch.');
+    }
   };
 
   // -------------------------------------------------------------
@@ -530,6 +523,14 @@ export default function Home() {
             </div>
 
             <div className="flex items-center gap-3">
+              {userRole === 'admin' && (
+                <button
+                  onClick={() => setIsManualPunchOpen(true)}
+                  className="bg-emerald-50 hover:bg-emerald-600 text-emerald-700 hover:text-white border border-emerald-200 px-4 py-2 rounded-xl font-black text-xs uppercase tracking-wider transition-all shadow-sm"
+                >
+                  ⚡ Manual Sign In/Out
+                </button>
+              )}
               <a
                 href="/kiosk"
                 target="_blank"
@@ -663,7 +664,7 @@ export default function Home() {
                               <span className="font-bold text-black block">{log.worker_name || 'Worker'}</span>
                               <span className="font-mono text-[10px] text-slate-400">ID: #{log.worker_id}</span>
                             </td>
-                            <td className="py-4 font-mono text-slate-600">{log.date}</td>
+                            <td className="py-4 font-mono text-slate-600">{normalizeDate(log.date)}</td>
                             <td className="py-4 font-mono font-bold text-emerald-600">{log.clock_in}</td>
                             <td className="py-4 font-mono font-bold text-blue-600">{log.clock_out || '—'}</td>
                             <td className="py-4 font-mono text-slate-600">
@@ -700,7 +701,7 @@ export default function Home() {
               </div>
             )}
 
-            {/* TAB 2: CALENDAR VIEW & DAILY SHIFT INSPECTOR (NEW) */}
+            {/* TAB 2: CALENDAR VIEW & DAILY SHIFT INSPECTOR */}
             {adminTab === 'calendar' && (
               <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-8">
                 <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-b border-slate-100 pb-6">
@@ -711,7 +712,6 @@ export default function Home() {
                     </p>
                   </div>
 
-                  {/* Date and Worker Filter Controls */}
                   <div className="flex flex-wrap items-center gap-3 w-full md:w-auto">
                     <div>
                       <label className="block text-[9px] font-black uppercase tracking-wider text-slate-400 mb-1">Pick Date</label>
@@ -738,7 +738,6 @@ export default function Home() {
                   </div>
                 </div>
 
-                {/* Day Summary Highlights */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                   <div className="p-5 rounded-2xl bg-slate-50 border border-slate-100">
                     <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Total Shifts</p>
@@ -774,7 +773,6 @@ export default function Home() {
                   </div>
                 </div>
 
-                {/* Detailed Cards for Each Worker on That Date */}
                 <div className="space-y-4">
                   <h3 className="text-sm font-black uppercase tracking-wider text-slate-400">
                     Shift Breakdowns for {selectedCalendarDate}
@@ -808,7 +806,6 @@ export default function Home() {
                               )}
                             </div>
 
-                            {/* Scheduled vs Actual Timing Grid */}
                             <div className="grid grid-cols-2 gap-3 text-xs bg-slate-50 p-4 rounded-2xl border border-slate-100">
                               <div>
                                 <span className="text-[9px] font-black uppercase tracking-wider text-slate-400 block">Scheduled Start</span>
@@ -830,7 +827,6 @@ export default function Home() {
                               </div>
                             </div>
 
-                            {/* Financial Breakdown for the Shift */}
                             <div className="flex justify-between items-center text-xs pt-2 border-t border-slate-100">
                               <div>
                                 {metrics.lateDeduction > 0 && (
@@ -864,34 +860,32 @@ export default function Home() {
               </div>
             )}
 
-            {/* TAB 3: MANAGE STAFF, SHIFT TIMINGS & WAGES (NEW) */}
+            {/* TAB 3: MANAGE STAFF, SHIFT TIMINGS & WAGES (Daily / Hourly / Monthly Options) */}
             {adminTab === 'wages' && (
               <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
                 <div>
                   <h2 className="text-2xl font-black tracking-tight text-black">Worker Shift Timings & Wage Master</h2>
                   <p className="text-xs text-slate-400 font-semibold mt-0.5">
-                    Define scheduled shift hours, monthly salaries, hourly conversion rates, and late comer penalty rules
+                    Configure staff on Monthly Salary, Daily Basis, or Per Hour with auto-calculated rates
                   </p>
                 </div>
 
                 <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse min-w-[800px]">
+                  <table className="w-full text-left border-collapse min-w-[850px]">
                     <thead>
                       <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
                         <th className="pb-3 pl-2">Staff Member</th>
+                        <th className="pb-3">Pay Basis</th>
                         <th className="pb-3">Scheduled Shift</th>
-                        <th className="pb-3">Monthly Wage</th>
-                        <th className="pb-3">Calculated Hourly</th>
+                        <th className="pb-3">Monthly / Base Wage</th>
+                        <th className="pb-3">Calculated Rate</th>
                         <th className="pb-3">OT Multiplier</th>
-                        <th className="pb-3">Grace Period</th>
                         <th className="pb-3 text-right pr-2">Actions</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 text-xs font-semibold">
                       {teamMembers.map(member => {
                         const profile = getWorkerProfile(member.user_id);
-                        const dailyWage = Math.round(profile.monthly_salary / profile.working_days);
-                        const hourly = Math.round(dailyWage / 10);
 
                         return (
                           <tr key={member.id} className="hover:bg-slate-50/70 transition-colors">
@@ -899,23 +893,31 @@ export default function Home() {
                               <span className="font-bold text-black block">{member.full_name}</span>
                               <span className="font-mono text-[10px] text-slate-400">ID: #{member.user_id} • {member.designations}</span>
                             </td>
+                            <td className="py-4">
+                              <span className={`px-2.5 py-1 rounded-lg text-[10px] font-black uppercase tracking-wider ${
+                                profile.pay_basis === 'monthly' ? 'bg-indigo-50 text-indigo-700 border border-indigo-200' :
+                                profile.pay_basis === 'daily' ? 'bg-amber-50 text-amber-700 border border-amber-200' :
+                                'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                              }`}>
+                                {profile.pay_basis}
+                              </span>
+                            </td>
                             <td className="py-4 font-mono text-slate-700">
                               <span className="px-2.5 py-1 rounded-lg bg-slate-100 font-bold">
                                 {profile.shift_start} - {profile.shift_end}
                               </span>
                             </td>
                             <td className="py-4 font-mono font-bold text-black">
-                              Rs. {profile.monthly_salary.toLocaleString()}
+                              {profile.pay_basis === 'monthly' && `Rs. ${profile.monthly_salary.toLocaleString()} /mo`}
+                              {profile.pay_basis === 'daily' && `Rs. ${profile.daily_wage.toLocaleString()} /day`}
+                              {profile.pay_basis === 'hourly' && `Rs. ${profile.hourly_rate.toLocaleString()} /hr`}
                             </td>
                             <td className="py-4 font-mono text-slate-600">
-                              Rs. {hourly}/hr
-                              <span className="block text-[9px] text-slate-400">Rs. {dailyWage}/day</span>
+                              Rs. {profile.hourly_rate}/hr
+                              <span className="block text-[9px] text-slate-400">Rs. {profile.daily_wage}/day</span>
                             </td>
                             <td className="py-4 font-mono text-[#FF6600] font-bold">
-                              {profile.ot_multiplier}x (Rs. {Math.round(hourly * profile.ot_multiplier)}/h)
-                            </td>
-                            <td className="py-4 font-mono text-slate-600">
-                              {profile.grace_period_mins} mins
+                              {profile.ot_multiplier}x (Rs. {Math.round(profile.hourly_rate * profile.ot_multiplier)}/h)
                             </td>
                             <td className="py-4 pr-2 text-right">
                               <button
@@ -1029,7 +1031,9 @@ export default function Home() {
                         <tr key={row.id} className="hover:bg-slate-50/70 transition-colors">
                           <td className="py-4 pl-2 font-bold text-black">
                             {row.full_name}
-                            <span className="block font-mono text-[10px] text-slate-400">Base: Rs. {row.profile.monthly_salary.toLocaleString()}</span>
+                            <span className="block font-mono text-[10px] text-slate-400">
+                              Base ({row.profile.pay_basis}): Rs. {row.profile.pay_basis === 'monthly' ? row.profile.monthly_salary.toLocaleString() : row.profile.daily_wage.toLocaleString() + '/d'}
+                            </span>
                           </td>
                           <td className="py-4 font-mono text-slate-600">{row.daysWorked} Shifts</td>
                           <td className="py-4 font-mono text-slate-600">{row.regularHours}h (+{row.otHours}h OT)</td>
@@ -1187,33 +1191,268 @@ export default function Home() {
           </main>
         )}
 
-        {/* ---------------- WORKER DASHBOARD ---------------- */}
-        {userRole === 'worker' && (
-          <main className="max-w-4xl mx-auto px-4 py-12 space-y-8">
-            <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm text-center">
-              <span className="w-16 h-16 bg-orange-100 text-[#FF6600] rounded-2xl flex items-center justify-center mx-auto text-3xl mb-4 font-black">
-                AF
-              </span>
-              <h2 className="text-3xl font-black text-black">Welcome, {userData?.full_name}</h2>
-              <p className="text-xs text-slate-400 font-semibold mt-1">
-                Department: {userData?.designation || 'Production Floor'} • ID: #{userData?.user_id}
-              </p>
+        {/* ---------------- WORKER DASHBOARD (Enhanced with Full Details) ---------------- */}
+        {userRole === 'worker' && (() => {
+          const workerId = userData?.user_id || String(userData?.id || '');
+          const myLogs = attendanceLogs.filter(l => l.worker_id === workerId);
+          const profile = getWorkerProfile(workerId);
 
-              <div className="mt-8 flex flex-col sm:flex-row justify-center gap-4">
+          // Filtering worker logs
+          const filteredLogs = myLogs.filter(l => {
+            const dateStr = normalizeDate(l.date);
+            if (workerHistoryRange === 'month') {
+              const currentMonth = new Date().toISOString().substring(0, 7);
+              return dateStr.startsWith(currentMonth);
+            }
+            if (workerHistoryRange === 'custom' && workerCustomStart && workerCustomEnd) {
+              return dateStr >= workerCustomStart && dateStr <= workerCustomEnd;
+            }
+            return true;
+          });
+
+          let totalReg = 0;
+          let totalOt = 0;
+          let totalDeductions = 0;
+          let totalOtEarned = 0;
+          let netEarned = 0;
+
+          filteredLogs.forEach(l => {
+            const reg = parseFloat(String(l.regular_hours || 0));
+            const ot = parseFloat(String(l.overtime_hours || 0));
+            totalReg += reg;
+            totalOt += ot;
+            const m = calculateShiftMetrics(workerId, l.clock_in, reg, ot);
+            totalDeductions += m.lateDeduction;
+            totalOtEarned += m.otEarned;
+            netEarned += m.netDayPay;
+          });
+
+          return (
+            <main className="max-w-5xl mx-auto px-4 py-12 space-y-8">
+              {/* Profile Card */}
+              <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm flex flex-col sm:flex-row justify-between items-center gap-6">
+                <div className="flex items-center gap-4">
+                  <div className="w-16 h-16 bg-orange-100 text-[#FF6600] rounded-2xl flex items-center justify-center text-3xl font-black">
+                    AF
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-black text-black">Welcome, {userData?.full_name}</h2>
+                    <p className="text-xs text-slate-400 font-semibold mt-0.5">
+                      {userData?.designation || 'Production Floor'} • ID: #{workerId} • Basis: <span className="uppercase font-bold text-black">{profile.pay_basis}</span>
+                    </p>
+                  </div>
+                </div>
                 <a
                   href="/kiosk"
                   target="_blank"
                   rel="noreferrer"
-                  className="bg-[#FF6600] text-white px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-black transition-all shadow-lg shadow-orange-500/20"
+                  className="bg-[#FF6600] hover:bg-black text-white px-6 py-3.5 rounded-2xl font-black text-xs uppercase tracking-widest transition-all shadow-lg shadow-orange-500/20"
                 >
-                  Open Attendance Terminal ↗
+                  Open Terminal Gate ↗
                 </a>
               </div>
+
+              {/* Financial & Time Statistics Summary */}
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
+                  <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Total Shifts Logged</p>
+                  <p className="text-3xl font-black text-black mt-2">{filteredLogs.length}</p>
+                  <p className="text-[11px] text-slate-400 mt-1">Within selected range</p>
+                </div>
+                <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
+                  <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Regular / OT Hours</p>
+                  <p className="text-3xl font-black text-[#FF6600] mt-2">{totalReg.toFixed(1)}h</p>
+                  <p className="text-[11px] text-emerald-600 font-bold mt-1">+{totalOt.toFixed(1)}h Overtime</p>
+                </div>
+                <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
+                  <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Late Deductions</p>
+                  <p className="text-3xl font-black text-red-500 mt-2">-Rs. {totalDeductions.toLocaleString()}</p>
+                  <p className="text-[11px] text-slate-400 mt-1">Grace period: {profile.grace_period_mins}m</p>
+                </div>
+                <div className="bg-black text-white p-6 rounded-3xl shadow-xl flex flex-col justify-between">
+                  <p className="text-[9px] font-black uppercase tracking-widest text-[#FF6600]">Estimated Earnings</p>
+                  <p className="text-3xl font-black font-mono">Rs. {netEarned.toLocaleString()}</p>
+                  <p className="text-[10px] text-slate-400 font-mono">Includes OT & penalties</p>
+                </div>
+              </div>
+
+              {/* Attendance Timings & Range Filters */}
+              <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm space-y-6">
+                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                  <div>
+                    <h3 className="text-xl font-black text-black">My Attendance & Wage Log</h3>
+                    <p className="text-xs text-slate-400 font-semibold mt-0.5">Detailed view of your shifts, timings, and deductions</p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      onClick={() => setWorkerHistoryRange('all')}
+                      className={`px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all ${
+                        workerHistoryRange === 'all' ? 'bg-[#FF6600] text-white' : 'bg-slate-100 text-slate-600'
+                      }`}
+                    >
+                      All Time
+                    </button>
+                    <button
+                      onClick={() => setWorkerHistoryRange('month')}
+                      className={`px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all ${
+                        workerHistoryRange === 'month' ? 'bg-[#FF6600] text-white' : 'bg-slate-100 text-slate-600'
+                      }`}
+                    >
+                      This Month
+                    </button>
+                    <button
+                      onClick={() => setWorkerHistoryRange('custom')}
+                      className={`px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all ${
+                        workerHistoryRange === 'custom' ? 'bg-[#FF6600] text-white' : 'bg-slate-100 text-slate-600'
+                      }`}
+                    >
+                      Custom Range
+                    </button>
+                  </div>
+                </div>
+
+                {workerHistoryRange === 'custom' && (
+                  <div className="flex flex-wrap items-center gap-4 bg-slate-50 p-4 rounded-2xl border border-slate-200">
+                    <div>
+                      <label className="block text-[9px] font-black uppercase text-slate-400 mb-1">Start Date</label>
+                      <input
+                        type="date"
+                        value={workerCustomStart}
+                        onChange={(e) => setWorkerCustomStart(e.target.value)}
+                        className="px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[9px] font-black uppercase text-slate-400 mb-1">End Date</label>
+                      <input
+                        type="date"
+                        value={workerCustomEnd}
+                        onChange={(e) => setWorkerCustomEnd(e.target.value)}
+                        className="px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold font-mono"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse min-w-[700px]">
+                    <thead>
+                      <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
+                        <th className="pb-3 pl-2">Date</th>
+                        <th className="pb-3">Clock In</th>
+                        <th className="pb-3">Clock Out</th>
+                        <th className="pb-3">Hours (Reg + OT)</th>
+                        <th className="pb-3">Late Penalty</th>
+                        <th className="pb-3 text-right pr-2">Net Shift Pay</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-xs font-semibold">
+                      {filteredLogs.map(log => {
+                        const reg = parseFloat(String(log.regular_hours || 0));
+                        const ot = parseFloat(String(log.overtime_hours || 0));
+                        const m = calculateShiftMetrics(workerId, log.clock_in, reg, ot);
+
+                        return (
+                          <tr key={log.id} className="hover:bg-slate-50/70 transition-colors">
+                            <td className="py-4 pl-2 font-mono font-bold text-black">{normalizeDate(log.date)}</td>
+                            <td className="py-4 font-mono font-bold text-emerald-600">{log.clock_in}</td>
+                            <td className="py-4 font-mono font-bold text-blue-600">{log.clock_out || 'Active Shift'}</td>
+                            <td className="py-4 font-mono text-slate-600">
+                              {log.clock_out ? `${(reg + ot).toFixed(1)}h (${reg}h + ${ot}h OT)` : 'In Progress'}
+                            </td>
+                            <td className="py-4 font-mono text-red-500 font-bold">
+                              {m.lateDeduction > 0 ? `-Rs. ${m.lateDeduction} (${m.lateMins}m late)` : 'None'}
+                            </td>
+                            <td className="py-4 pr-2 text-right font-mono font-black text-black">
+                              Rs. {m.netDayPay.toLocaleString()}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                      {filteredLogs.length === 0 && (
+                        <tr>
+                          <td colSpan={6} className="py-12 text-center text-slate-400 italic">
+                            No attendance records found for the selected range.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </main>
+          );
+        })()}
+
+        {/* ---------------- MANUAL ADMIN PUNCH MODAL ---------------- */}
+        {isManualPunchOpen && (
+          <div className="fixed inset-0 z-[7000] flex items-center justify-center bg-black/75 backdrop-blur-md p-4">
+            <div className="bg-white rounded-3xl max-w-md w-full p-8 shadow-2xl relative border border-slate-200 animate-in zoom-in-95">
+              <button
+                onClick={() => setIsManualPunchOpen(false)}
+                className="absolute top-6 right-6 text-slate-400 hover:text-black font-bold text-lg"
+              >
+                ✕
+              </button>
+
+              <h3 className="text-xl font-black text-black">Manual Member Sign In/Out</h3>
+              <p className="text-xs text-slate-400 font-semibold mt-1">
+                Admin override to manually log attendance for any worker
+              </p>
+
+              <form onSubmit={handleManualPunchSubmit} className="space-y-4 mt-6 text-xs">
+                <div>
+                  <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Select Worker</label>
+                  <select
+                    value={manualWorkerId}
+                    onChange={(e) => setManualWorkerId(e.target.value)}
+                    required
+                    className="w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none focus:border-[#FF6600]"
+                  >
+                    <option value="">-- Choose Team Member --</option>
+                    {teamMembers.map(m => (
+                      <option key={m.id} value={m.user_id}>{m.full_name} (#{m.user_id}) - {m.designations || m.role}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Action Type</label>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setManualAction('in')}
+                      className={`py-3 rounded-xl font-black uppercase tracking-wider transition-all border ${
+                        manualAction === 'in' ? 'bg-emerald-600 text-white border-emerald-600 shadow-md' : 'bg-slate-50 text-slate-600 border-slate-200'
+                      }`}
+                    >
+                      Clock In
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setManualAction('out')}
+                      className={`py-3 rounded-xl font-black uppercase tracking-wider transition-all border ${
+                        manualAction === 'out' ? 'bg-blue-600 text-white border-blue-600 shadow-md' : 'bg-slate-50 text-slate-600 border-slate-200'
+                      }`}
+                    >
+                      Clock Out
+                    </button>
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest transition-all shadow-md shadow-orange-500/20"
+                >
+                  Execute Manual {manualAction === 'in' ? 'Clock In' : 'Clock Out'}
+                </button>
+              </form>
             </div>
-          </main>
+          </div>
         )}
 
-        {/* ---------------- WAGE PROFILE CONFIG MODAL ---------------- */}
+        {/* ---------------- WAGE PROFILE CONFIG MODAL (Daily / Hourly / Monthly Options) ---------------- */}
         {editingWageWorker && (
           <div className="fixed inset-0 z-[7000] flex items-center justify-center bg-black/75 backdrop-blur-md p-4">
             <div className="bg-white rounded-3xl max-w-lg w-full p-8 shadow-2xl relative border border-slate-200 animate-in zoom-in-95">
@@ -1242,13 +1481,26 @@ export default function Home() {
                 }}
                 className="space-y-4 mt-6 text-xs"
               >
+                <div>
+                  <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Pay Basis Selection</label>
+                  <select
+                    value={wageFormState.pay_basis}
+                    onChange={(e) => updateWageForm({ pay_basis: e.target.value as any })}
+                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none focus:border-[#FF6600]"
+                  >
+                    <option value="monthly">Monthly Salary Based</option>
+                    <option value="daily">Daily Wage Basis</option>
+                    <option value="hourly">Per Hour Rate Basis</option>
+                  </select>
+                </div>
+
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Shift Start Time</label>
                     <input
                       type="time"
                       value={wageFormState.shift_start}
-                      onChange={(e) => setWageFormState({ ...wageFormState, shift_start: e.target.value })}
+                      onChange={(e) => updateWageForm({ shift_start: e.target.value })}
                       className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                     />
                   </div>
@@ -1257,7 +1509,7 @@ export default function Home() {
                     <input
                       type="time"
                       value={wageFormState.shift_end}
-                      onChange={(e) => setWageFormState({ ...wageFormState, shift_end: e.target.value })}
+                      onChange={(e) => updateWageForm({ shift_end: e.target.value })}
                       className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                     />
                   </div>
@@ -1265,11 +1517,21 @@ export default function Home() {
 
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Monthly Salary (PKR)</label>
+                    <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
+                      {wageFormState.pay_basis === 'monthly' ? 'Monthly Salary (PKR)' : wageFormState.pay_basis === 'daily' ? 'Daily Wage (PKR)' : 'Hourly Rate (PKR)'}
+                    </label>
                     <input
                       type="number"
-                      value={wageFormState.monthly_salary}
-                      onChange={(e) => setWageFormState({ ...wageFormState, monthly_salary: Number(e.target.value) })}
+                      value={
+                        wageFormState.pay_basis === 'monthly' ? wageFormState.monthly_salary :
+                        wageFormState.pay_basis === 'daily' ? wageFormState.daily_wage : wageFormState.hourly_rate
+                      }
+                      onChange={(e) => {
+                        const val = Number(e.target.value);
+                        if (wageFormState.pay_basis === 'monthly') updateWageForm({ monthly_salary: val });
+                        else if (wageFormState.pay_basis === 'daily') updateWageForm({ daily_wage: val });
+                        else updateWageForm({ hourly_rate: val });
+                      }}
                       className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                     />
                   </div>
@@ -1278,7 +1540,7 @@ export default function Home() {
                     <input
                       type="number"
                       value={wageFormState.working_days}
-                      onChange={(e) => setWageFormState({ ...wageFormState, working_days: Number(e.target.value) })}
+                      onChange={(e) => updateWageForm({ working_days: Number(e.target.value) })}
                       className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                     />
                   </div>
@@ -1291,7 +1553,7 @@ export default function Home() {
                       type="number"
                       step="0.1"
                       value={wageFormState.ot_multiplier}
-                      onChange={(e) => setWageFormState({ ...wageFormState, ot_multiplier: Number(e.target.value) })}
+                      onChange={(e) => updateWageForm({ ot_multiplier: Number(e.target.value) })}
                       className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                     />
                   </div>
@@ -1300,7 +1562,7 @@ export default function Home() {
                     <input
                       type="number"
                       value={wageFormState.grace_period_mins}
-                      onChange={(e) => setWageFormState({ ...wageFormState, grace_period_mins: Number(e.target.value) })}
+                      onChange={(e) => updateWageForm({ grace_period_mins: Number(e.target.value) })}
                       className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                     />
                   </div>
@@ -1308,15 +1570,12 @@ export default function Home() {
 
                 {/* Calculation Preview */}
                 <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200 font-mono text-[11px] space-y-1">
-                  <p className="text-slate-500 font-bold uppercase tracking-wider text-[9px]">Rate Projections:</p>
-                  <p className="text-black">
-                    Daily Wage: <strong>Rs. {Math.round(wageFormState.monthly_salary / wageFormState.working_days)}</strong>
-                  </p>
-                  <p className="text-black">
-                    Hourly Wage (10h shift): <strong>Rs. {Math.round((wageFormState.monthly_salary / wageFormState.working_days) / 10)}/h</strong>
-                  </p>
+                  <p className="text-slate-500 font-bold uppercase tracking-wider text-[9px]">Auto-Calculated Rates:</p>
+                  <p className="text-black">Monthly: <strong>Rs. {wageFormState.monthly_salary.toLocaleString()}</strong></p>
+                  <p className="text-black">Daily Wage: <strong>Rs. {wageFormState.daily_wage.toLocaleString()}</strong></p>
+                  <p className="text-black">Hourly Wage: <strong>Rs. {wageFormState.hourly_rate}/hr</strong></p>
                   <p className="text-[#FF6600]">
-                    Late Penalty Rate: <strong>Rs. {((Math.round((wageFormState.monthly_salary / wageFormState.working_days) / 10)) / 60).toFixed(2)}/min</strong> after {wageFormState.grace_period_mins}m grace
+                    Late Penalty Rate: <strong>Rs. {(wageFormState.hourly_rate / 60).toFixed(2)}/min</strong> after {wageFormState.grace_period_mins}m grace
                   </p>
                 </div>
 
@@ -1450,11 +1709,10 @@ export default function Home() {
   }
 
   // =============================================================
-  // PUBLIC WEBSITE VIEW (High-End White, Black & Orange Theme)
+  // PUBLIC WEBSITE VIEW
   // =============================================================
   return (
     <main className="min-h-screen bg-white font-sans text-[#111827] antialiased selection:bg-[#FF6600] selection:text-white">
-      {/* Top Brand Navigation */}
       <nav className="sticky top-0 z-50 bg-white/90 backdrop-blur-md border-b border-slate-100">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex justify-between items-center">
           <div className="flex items-center gap-3">
@@ -1551,7 +1809,6 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Hero Visual Card Deck */}
             <div className="lg:col-span-5 grid grid-cols-2 gap-4">
               <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-xl shadow-slate-200/50 space-y-3">
                 <span className="text-3xl">🖨️</span>
@@ -1578,7 +1835,7 @@ export default function Home() {
         </div>
       </section>
 
-      {/* ---------------- SERVICES CATALOGUE ---------------- */}
+      {/* Services Catalogue */}
       <section id="services" className="py-24 bg-slate-50 border-b border-slate-100">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 space-y-12">
           <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-4">
@@ -1629,7 +1886,7 @@ export default function Home() {
         </div>
       </section>
 
-      {/* ---------------- INSTANT RATE ESTIMATOR ---------------- */}
+      {/* Instant Rate Estimator */}
       <section id="calculator" className="py-24 bg-white border-b border-slate-100">
         <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="bg-black text-white rounded-[40px] p-8 sm:p-14 shadow-2xl relative overflow-hidden">
@@ -1708,7 +1965,7 @@ export default function Home() {
         </div>
       </section>
 
-      {/* ---------------- PRODUCTION PLANT & HQ INFO ---------------- */}
+      {/* About Plant */}
       <section id="about" className="py-24 bg-slate-50 border-b border-slate-100">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="grid lg:grid-cols-2 gap-12 items-center">
@@ -1774,87 +2031,7 @@ export default function Home() {
         </div>
       </section>
 
-      {/* ---------------- PROJECT BRIEF MODAL ---------------- */}
-      {isProjectModalOpen && (
-        <div className="fixed inset-0 z-[6000] flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
-          <div className="bg-white rounded-3xl max-w-lg w-full p-8 shadow-2xl relative border border-slate-200 animate-in zoom-in-95">
-            <button
-              onClick={() => setIsProjectModalOpen(false)}
-              className="absolute top-6 right-6 text-slate-400 hover:text-black font-bold text-lg"
-            >
-              ✕
-            </button>
-
-            <h3 className="text-2xl font-black text-black uppercase tracking-tight">Submit Project Brief</h3>
-            <p className="text-xs text-slate-400 font-semibold mt-1">
-              Direct submission to Al Fareed production queue
-            </p>
-
-            <form
-              onSubmit={async (e) => {
-                e.preventDefault();
-                const formData = new FormData(e.currentTarget);
-                const payload = Object.fromEntries(formData);
-                try {
-                  const res = await fetch('/api/projects/submit', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                  });
-                  if (res.ok) {
-                    alert('Project Brief Transmitted Successfully!');
-                    setIsProjectModalOpen(false);
-                  } else {
-                    alert('Brief received! Our team will contact you.');
-                    setIsProjectModalOpen(false);
-                  }
-                } catch (err) {
-                  alert('Transmission saved!');
-                  setIsProjectModalOpen(false);
-                }
-              }}
-              className="space-y-4 mt-6"
-            >
-              <div>
-                <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Entity / Contact Name</label>
-                <input name="client_name" required placeholder="Your Name or Company" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Service Type</label>
-                  <select name="service_type" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]">
-                    <option value="Printing">Printing & Packaging</option>
-                    <option value="Composing">Urdu / Legal Composing</option>
-                    <option value="Smart Cards">Smart PVC / NFC Badges</option>
-                    <option value="Binding">Luxury Binding & Finishing</option>
-                    <option value="Flex Signage">Panaflex & Billboard</option>
-                    <option value="Software">Web Portal / ERP</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">WhatsApp / Phone</label>
-                  <input name="phone" required placeholder="0300-1234567" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Project Details & Quantity</label>
-                <textarea name="description" required rows={3} placeholder="Provide specs, quantity, deadlines..." className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
-              </div>
-
-              <button
-                type="submit"
-                className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest transition-all shadow-md shadow-orange-500/20"
-              >
-                Transmit Brief →
-              </button>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* ---------------- LOGIN MODAL ---------------- */}
+      {/* Login Modal */}
       {isLoginOpen && (
         <div className="fixed inset-0 z-[6000] flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
           <div className="bg-white rounded-3xl max-w-sm w-full p-8 shadow-2xl relative border border-slate-200 animate-in zoom-in-95">
@@ -1930,7 +2107,6 @@ export default function Home() {
         </a>
       </div>
 
-      {/* Corporate Footer */}
       <footer className="bg-black text-white py-12 border-t border-slate-900">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col md:flex-row justify-between items-center gap-6">
           <div className="flex items-center gap-3">
