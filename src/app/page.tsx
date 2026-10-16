@@ -1404,7 +1404,7 @@ export default function Home() {
             <div className="bg-white p-6 sm:p-8 rounded-3xl border border-slate-200 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
               <div className="flex items-center gap-4">
                 <span className="w-14 h-14 bg-orange-100 text-[#FF6600] rounded-2xl flex items-center justify-center text-2xl font-black">
-                  AF
+                  ALFAREED
                 </span>
                 <div>
                   <h2 className="text-2xl font-black text-black">Welcome back, {userData?.full_name}</h2>
@@ -1914,7 +1914,7 @@ export default function Home() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex justify-between items-center">
           <div className="flex items-center gap-3">
             <div className="w-11 h-11 bg-black rounded-2xl flex items-center justify-center text-white font-black text-xl shadow-lg border border-black">
-              AF<span className="text-[#FF6600]">.</span>
+              ALFAREED<span className="text-[#FF6600]">.</span>
             </div>
             <div>
               <div className="flex items-center gap-1.5 leading-none">
@@ -2269,7 +2269,7 @@ export default function Home() {
             </button>
             <div className="text-center mb-6">
               <span className="w-12 h-12 bg-black text-[#FF6600] rounded-2xl flex items-center justify-center mx-auto text-xl font-black mb-3">
-                AF
+                ALFAREED
               </span>
               <h3 className="text-2xl font-black text-black uppercase tracking-tight">System Access</h3>
               <p className="text-xs text-slate-400 font-semibold mt-1">Enter your terminal credentials</p>
