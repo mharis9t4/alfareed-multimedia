@@ -40,29 +40,12 @@ interface ProjectBrief {
 }
 
 interface WorkerWageConfig {
-  pay_basis: 'monthly' | 'daily' | 'hourly';
-  shift_start: string; // e.g. "10:00"
-  shift_end: string;   // e.g. "20:00"
-  monthly_salary: number; // in PKR
-  daily_wage: number;
-  hourly_rate: number;
-  working_days: number;   // default 26
-  ot_multiplier: number;  // default 1.5x
-  grace_period_mins: number; // default 15
-}
-
-// Helper to normalize any date string to YYYY-MM-DD for calendar comparison
-function normalizeDate(dateStr: string): string {
-  if (!dateStr) return '';
-  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
-  const parsed = new Date(dateStr);
-  if (!isNaN(parsed.getTime())) {
-    const y = parsed.getFullYear();
-    const m = String(parsed.getMonth() + 1).padStart(2, '0');
-    const d = String(parsed.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
-  }
-  return dateStr.substring(0, 10);
+  shift_start: string;
+  shift_end: string;
+  monthly_salary: number;
+  working_days: number;
+  ot_multiplier: number;
+  grace_period_mins: number;
 }
 
 export default function Home() {
@@ -81,27 +64,42 @@ export default function Home() {
   const [attendanceSearch, setAttendanceSearch] = useState('');
   const [isRefreshing, setIsRefreshing] = useState(false);
 
-  // Manual Punch Modal State for Admin
-  const [isManualPunchOpen, setIsManualPunchOpen] = useState(false);
-  const [manualWorkerId, setManualWorkerId] = useState('');
-  const [manualAction, setManualAction] = useState<'in' | 'out'>('in');
-
-  // Calendar View State
+  // Calendar View State (Admin)
   const [selectedCalendarDate, setSelectedCalendarDate] = useState<string>(() => {
     return new Date().toISOString().split('T')[0];
   });
   const [selectedWorkerFilter, setSelectedWorkerFilter] = useState<string>('ALL');
 
-  // Worker Wage Profiles Map (worker_id -> Config)
+  // Manual Adjust Modal State (Admin)
+  const [isManualModalOpen, setIsManualModalOpen] = useState(false);
+  const [manualForm, setManualForm] = useState<{
+    record_id?: number | null;
+    worker_id: string;
+    date: string;
+    clock_in: string;
+    clock_out: string;
+    status: string;
+  }>({
+    record_id: null,
+    worker_id: '',
+    date: new Date().toISOString().split('T')[0],
+    clock_in: '10:00:00 AM',
+    clock_out: '08:00:00 PM',
+    status: 'Completed'
+  });
+
+  // Worker Dashboard View State
+  const [workerSelectedDate, setWorkerSelectedDate] = useState<string>(() => {
+    return new Date().toISOString().split('T')[0];
+  });
+
+  // Wage Profiles Map (worker_id -> Config)
   const [wageProfiles, setWageProfiles] = useState<Record<string, WorkerWageConfig>>({});
   const [editingWageWorker, setEditingWageWorker] = useState<TeamMember | null>(null);
   const [wageFormState, setWageFormState] = useState<WorkerWageConfig>({
-    pay_basis: 'monthly',
     shift_start: '10:00',
     shift_end: '20:00',
     monthly_salary: 35000,
-    daily_wage: 1346,
-    hourly_rate: 135,
     working_days: 26,
     ot_multiplier: 1.5,
     grace_period_mins: 15
@@ -116,15 +114,12 @@ export default function Home() {
     type: 'idle'
   });
 
-  // Worker Dashboard Filtering State
-  const [workerHistoryRange, setWorkerHistoryRange] = useState<'all' | 'month' | 'custom'>('all');
-  const [workerCustomStart, setWorkerCustomStart] = useState('');
-  const [workerCustomEnd, setWorkerCustomEnd] = useState('');
-
   // Public Landing Page Modals & Calculator
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
   const [calcService, setCalcService] = useState<'bw_copy' | 'color_print' | 'pvc_card' | 'composing' | 'spiral_binding' | 'hard_binding' | 'panaflex'>('color_print');
   const [calcQuantity, setCalcQuantity] = useState<number>(50);
+
+  const printingRef = useRef<HTMLDivElement>(null);
 
   // -------------------------------------------------------------
   // SESSION & WAGE PROFILE PERSISTENCE
@@ -189,43 +184,105 @@ export default function Home() {
   }, [userRole]);
 
   // -------------------------------------------------------------
-  // WAGE COMPUTATION HELPERS
+  // NFC ENROLLMENT LISTENER (Keyboard Wedge + Android Web NFC)
+  // -------------------------------------------------------------
+  useEffect(() => {
+    if (!isNfcModalOpen || !selectedWorker) return;
+
+    let buffer = '';
+    let flushTimer: NodeJS.Timeout;
+
+    const processScannedCard = async (scannedId: string) => {
+      const clean = scannedId.replace(/\D/g, '').trim();
+      if (clean.length < 4) return;
+
+      setNfcInput(clean);
+      setNfcStatus({ message: `Card ${clean} detected. Pairing...`, type: 'loading' });
+
+      try {
+        const res = await fetch('/api/users/assign-card', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: selectedWorker.user_id, cardId: clean })
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+          setNfcStatus({ message: `Card ${clean} successfully linked to ${selectedWorker.full_name}!`, type: 'success' });
+          fetchAllData();
+          setTimeout(() => {
+            setIsNfcModalOpen(false);
+            setSelectedWorker(null);
+          }, 1200);
+        } else {
+          setNfcStatus({ message: data.error || 'Failed to save card.', type: 'error' });
+        }
+      } catch (err) {
+        setNfcStatus({ message: 'Network connection failed.', type: 'error' });
+      }
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        if (buffer.length >= 4) processScannedCard(buffer);
+        buffer = '';
+        clearTimeout(flushTimer);
+        return;
+      }
+      if (/^\d$/.test(e.key)) {
+        buffer += e.key;
+        clearTimeout(flushTimer);
+        flushTimer = setTimeout(() => {
+          if (buffer.length >= 4) processScannedCard(buffer);
+          buffer = '';
+        }, 150);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+
+    // Mobile Android Chrome Web NFC
+    let ndef: any = null;
+    let abortController: AbortController | null = null;
+    if (typeof window !== 'undefined' && 'NDEFReader' in window) {
+      try {
+        abortController = new AbortController();
+        ndef = new (window as any).NDEFReader();
+        ndef.scan({ signal: abortController.signal }).then(() => {
+          ndef.onreading = (event: any) => {
+            if (!event.serialNumber) return;
+
+            const hexParts = event.serialNumber.split(':');
+            const first4 = hexParts.slice(0, 4);
+            const littleEndianHex = [...first4].reverse().join('');
+            const decValue = parseInt(littleEndianHex, 16);
+            const unifiedCardId = String(decValue).padStart(10, '0');
+
+            processScannedCard(unifiedCardId);
+          };
+        }).catch(() => {});
+      } catch (err) {}
+    }
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      clearTimeout(flushTimer);
+      if (abortController) abortController.abort();
+    };
+  }, [isNfcModalOpen, selectedWorker]);
+
+  // -------------------------------------------------------------
+  // WAGE & TIMING COMPUTATION HELPERS
   // -------------------------------------------------------------
   const getWorkerProfile = (workerId: string): WorkerWageConfig => {
     return wageProfiles[workerId] || {
-      pay_basis: 'monthly',
       shift_start: '10:00',
       shift_end: '20:00',
       monthly_salary: 35000,
-      daily_wage: 1346,
-      hourly_rate: 135,
       working_days: 26,
       ot_multiplier: 1.5,
       grace_period_mins: 15
     };
-  };
-
-  const updateWageForm = (updatedFields: Partial<WorkerWageConfig>) => {
-    const current = { ...wageFormState, ...updatedFields };
-    const workingDays = current.working_days || 26;
-
-    if (updatedFields.pay_basis === 'monthly' || ('monthly_salary' in updatedFields && current.pay_basis === 'monthly')) {
-      const daily = Math.round(current.monthly_salary / workingDays);
-      const hourly = Math.round(daily / 10);
-      current.daily_wage = daily;
-      current.hourly_rate = hourly;
-    } else if (updatedFields.pay_basis === 'daily' || ('daily_wage' in updatedFields && current.pay_basis === 'daily')) {
-      const monthly = Math.round(current.daily_wage * workingDays);
-      const hourly = Math.round(current.daily_wage / 10);
-      current.monthly_salary = monthly;
-      current.hourly_rate = hourly;
-    } else if (updatedFields.pay_basis === 'hourly' || ('hourly_rate' in updatedFields && current.pay_basis === 'hourly')) {
-      const daily = Math.round(current.hourly_rate * 10);
-      const monthly = Math.round(daily * workingDays);
-      current.daily_wage = daily;
-      current.monthly_salary = monthly;
-    }
-    setWageFormState(current);
   };
 
   const calculateShiftMetrics = (workerId: string, clockInStr: string, regHours: number, otHours: number) => {
@@ -248,12 +305,14 @@ export default function Home() {
     const isLate = diffMinutes > profile.grace_period_mins;
     const lateMins = isLate ? diffMinutes : 0;
 
-    const hourlyRate = profile.hourly_rate || Math.round((profile.monthly_salary / profile.working_days) / 10);
+    const dailyWage = Math.round(profile.monthly_salary / profile.working_days);
+    const hourlyRate = Math.round(dailyWage / 10);
     const minuteRate = hourlyRate / 60;
     
     const lateDeduction = isLate ? Math.round(lateMins * minuteRate) : 0;
     const otRate = Math.round(hourlyRate * profile.ot_multiplier);
     const otEarned = Math.round(otHours * otRate);
+
     const regEarned = Math.round(regHours * hourlyRate);
     const netDayPay = Math.max(0, regEarned + otEarned - lateDeduction);
 
@@ -261,6 +320,7 @@ export default function Home() {
       profile,
       isLate,
       lateMins,
+      dailyWage,
       hourlyRate,
       otRate,
       lateDeduction,
@@ -270,7 +330,78 @@ export default function Home() {
   };
 
   // -------------------------------------------------------------
-  // DYNAMIC STATS & DERIVED DATA
+  // ADMIN MANUAL ACTIONS
+  // -------------------------------------------------------------
+  const handleAdminClockOut = async (record: AttendanceRecord) => {
+    const nowTime = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Karachi',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    }).format(new Date());
+
+    const outTimeInput = prompt(`Manually Sign Out: ${record.worker_name || record.worker_id}\nEnter Clock Out Time:`, nowTime);
+    if (!outTimeInput) return;
+
+    try {
+      const res = await fetch('/api/attendance/manual', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'CLOCK_OUT',
+          record_id: record.id,
+          worker_id: record.worker_id,
+          clock_in: record.clock_in,
+          clock_out: outTimeInput.trim()
+        })
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        alert(`Signed out ${record.worker_name || record.worker_id} successfully!`);
+        fetchAllData();
+      } else {
+        alert(data.error || 'Failed to sign out worker.');
+      }
+    } catch (err) {
+      alert('Could not connect to the server.');
+    }
+  };
+
+  const handleSaveManualRecord = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      const res = await fetch('/api/attendance/manual', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'SAVE_ENTRY',
+          ...manualForm
+        })
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        alert('Attendance record updated successfully!');
+        setIsManualModalOpen(false);
+        fetchAllData();
+      } else {
+        alert(data.error || 'Failed to save attendance record.');
+      }
+    } catch (err) {
+      alert('Network error.');
+    }
+  };
+
+  const changeCalendarDateByDays = (days: number) => {
+    const current = new Date(selectedCalendarDate);
+    current.setDate(current.getDate() + days);
+    setSelectedCalendarDate(current.toISOString().split('T')[0]);
+  };
+
+  // -------------------------------------------------------------
+  // DYNAMIC DERIVED DATA
   // -------------------------------------------------------------
   const activeStaffCount = useMemo(() => {
     return attendanceLogs.filter(log => !log.clock_out).length;
@@ -293,11 +424,10 @@ export default function Home() {
     return (rates[calcService] || 10) * Math.max(1, calcQuantity);
   }, [calcService, calcQuantity]);
 
-  // Calendar filtered records using normalized date
+  // Calendar filtered records
   const calendarRecords = useMemo(() => {
     return attendanceLogs.filter(log => {
-      const normDate = normalizeDate(log.date);
-      const matchesDate = normDate === selectedCalendarDate;
+      const matchesDate = log.date === selectedCalendarDate;
       const matchesWorker = selectedWorkerFilter === 'ALL' || log.worker_id === selectedWorkerFilter;
       return matchesDate && matchesWorker;
     });
@@ -341,8 +471,18 @@ export default function Home() {
     });
   }, [teamMembers, attendanceLogs, wageProfiles]);
 
+  // Worker's personal data filter
+  const workerPersonalLogs = useMemo(() => {
+    if (!userData?.user_id) return [];
+    return attendanceLogs.filter(l => l.worker_id === userData.user_id);
+  }, [attendanceLogs, userData]);
+
+  const workerDateRecord = useMemo(() => {
+    return workerPersonalLogs.find(l => l.date === workerSelectedDate);
+  }, [workerPersonalLogs, workerSelectedDate]);
+
   // -------------------------------------------------------------
-  // AUTHENTICATION & MANUAL PUNCH HANDLERS
+  // AUTHENTICATION HANDLERS
   // -------------------------------------------------------------
   const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -385,45 +525,6 @@ export default function Home() {
     localStorage.removeItem('alfareed_session');
   };
 
-  const handleManualPunchSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!manualWorkerId) return;
-
-    try {
-      if (manualAction === 'in') {
-        const res = await fetch('/api/attendance', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ employee_id: manualWorkerId, status: 'Manual Admin Punch' })
-        });
-        if (res.ok) {
-          alert('Member successfully clocked in manually!');
-          setIsManualPunchOpen(false);
-          fetchAllData();
-        } else {
-          const err = await res.json();
-          alert(err.error || 'Failed to clock in');
-        }
-      } else {
-        const res = await fetch('/api/attendance/checkout', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ employee_id: manualWorkerId })
-        });
-        const data = await res.json();
-        if (res.ok) {
-          alert(`Member successfully clocked out! Overtime: ${data.overtime_hrs || 0}h`);
-          setIsManualPunchOpen(false);
-          fetchAllData();
-        } else {
-          alert(data.error || 'Failed to clock out');
-        }
-      }
-    } catch (err) {
-      alert('Network connection error during manual punch.');
-    }
-  };
-
   // -------------------------------------------------------------
   // SERVICES CATALOGUE DATA
   // -------------------------------------------------------------
@@ -432,7 +533,7 @@ export default function Home() {
       id: '01',
       title: 'Industrial Offset & Digital Printing',
       spec: 'Offset Presses & Production Digital Copiers',
-      desc: 'High-speed multi-color printing for corporate catalogs, magazines, letterheads, brochures, carbonless NCR bill books, and packaging boxes with Pantone precision.',
+      desc: 'High-speed multi-color printing for catalogs, magazines, letterheads, brochures, carbonless NCR bill books, and packaging boxes.',
       icon: '🖨️',
       tag: 'Core Production'
     },
@@ -448,7 +549,7 @@ export default function Home() {
       id: '03',
       title: 'Commercial Photostat & Duplication',
       spec: 'Konica Minolta bizhub High-Volume Fleet',
-      desc: 'High-volume digital photocopying, architectural blueprint reproduction, bulk exam copying, dual-sided ledger scanning, and rapid secure paper handling.',
+      desc: 'High-volume digital photocopying, blueprint reproduction, bulk exam copying, dual-sided ledger scanning, and rapid secure paper handling.',
       icon: '📑',
       tag: 'High Velocity'
     },
@@ -464,7 +565,7 @@ export default function Home() {
       id: '05',
       title: 'Finishing, Lamination & Luxury Binding',
       spec: 'Hot Foil Embossing • Rexine Hard Covers',
-      desc: 'Spiral coil, wire-o, comb binding, thermal glue binding, and handmade hard leatherette bookbinding with golden seal embossing and scratch-proof matte/gloss coatings.',
+      desc: 'Spiral coil, wire-o, comb binding, thermal glue binding, and handmade hard leatherette bookbinding with golden seal embossing.',
       icon: '📚',
       tag: 'Finishing Works'
     },
@@ -472,7 +573,7 @@ export default function Home() {
       id: '06',
       title: 'Outdoor Flex, Signage & Billboards',
       spec: 'Wide-Format UV & Solvent Outdoor Plotters',
-      desc: 'Heavy-duty Panaflex shop signs, street streamers, backlit commercial signage, frosted glass films, one-way vision graphics, and customized rollup standees.',
+      desc: 'Heavy-duty Panaflex shop signs, street streamers, backlit commercial signage, frosted glass films, and rollup standees.',
       icon: '🏛️',
       tag: 'Signage & Displays'
     },
@@ -488,7 +589,7 @@ export default function Home() {
       id: '08',
       title: 'Corporate Stationery & Digital Stamps',
       spec: 'Pre-Inked Flash Polymer & Brass Seals',
-      desc: 'Custom flash stamps, dater seals, official company monograms, premium executive envelopes, presentation folders, and corporate paper assortments.',
+      desc: 'Custom flash stamps, dater seals, official company monograms, premium executive envelopes, and corporate paper assortments.',
       icon: '🖋️',
       tag: 'Corporate Supply'
     }
@@ -523,14 +624,6 @@ export default function Home() {
             </div>
 
             <div className="flex items-center gap-3">
-              {userRole === 'admin' && (
-                <button
-                  onClick={() => setIsManualPunchOpen(true)}
-                  className="bg-emerald-50 hover:bg-emerald-600 text-emerald-700 hover:text-white border border-emerald-200 px-4 py-2 rounded-xl font-black text-xs uppercase tracking-wider transition-all shadow-sm"
-                >
-                  ⚡ Manual Sign In/Out
-                </button>
-              )}
               <a
                 href="/kiosk"
                 target="_blank"
@@ -550,7 +643,9 @@ export default function Home() {
           </div>
         </header>
 
-        {/* ---------------- ADMIN DASHBOARD ---------------- */}
+        {/* ========================================================= */}
+        {/* ADMIN DASHBOARD VIEW */}
+        {/* ========================================================= */}
         {userRole === 'admin' && (
           <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
             {/* Live Metrics Grid */}
@@ -561,7 +656,7 @@ export default function Home() {
                   <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
                 </div>
                 <p className="text-4xl font-black text-emerald-600 mt-2">{activeStaffCount}</p>
-                <p className="text-[11px] text-slate-400 font-semibold mt-1">Clocked in today (in shift)</p>
+                <p className="text-[11px] text-slate-400 font-semibold mt-1">Clocked in right now</p>
               </div>
 
               <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
@@ -621,7 +716,7 @@ export default function Home() {
               ))}
             </div>
 
-            {/* TAB 1: LIVE ATTENDANCE PUNCHES */}
+            {/* TAB 1: LIVE ATTENDANCE PUNCHES WITH MANUAL SIGN OUT */}
             {adminTab === 'attendance' && (
               <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
                 <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
@@ -641,7 +736,7 @@ export default function Home() {
                 </div>
 
                 <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse min-w-[700px]">
+                  <table className="w-full text-left border-collapse min-w-[750px]">
                     <thead>
                       <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
                         <th className="pb-3 pl-2">Worker / Entity</th>
@@ -649,7 +744,7 @@ export default function Home() {
                         <th className="pb-3">Clock In</th>
                         <th className="pb-3">Clock Out</th>
                         <th className="pb-3">Logged Duration</th>
-                        <th className="pb-3 text-right pr-2">Shift Status</th>
+                        <th className="pb-3 text-right pr-2">Actions</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 text-xs font-semibold">
@@ -664,7 +759,7 @@ export default function Home() {
                               <span className="font-bold text-black block">{log.worker_name || 'Worker'}</span>
                               <span className="font-mono text-[10px] text-slate-400">ID: #{log.worker_id}</span>
                             </td>
-                            <td className="py-4 font-mono text-slate-600">{normalizeDate(log.date)}</td>
+                            <td className="py-4 font-mono text-slate-600">{log.date}</td>
                             <td className="py-4 font-mono font-bold text-emerald-600">{log.clock_in}</td>
                             <td className="py-4 font-mono font-bold text-blue-600">{log.clock_out || '—'}</td>
                             <td className="py-4 font-mono text-slate-600">
@@ -676,14 +771,42 @@ export default function Home() {
                             </td>
                             <td className="py-4 pr-2 text-right">
                               {!log.clock_out ? (
-                                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                                  Active
-                                </span>
+                                <div className="flex items-center justify-end gap-2">
+                                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-200">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                                    Active
+                                  </span>
+                                  <button
+                                    onClick={() => handleAdminClockOut(log)}
+                                    className="bg-red-50 hover:bg-red-600 text-red-600 hover:text-white border border-red-200 hover:border-red-600 px-3 py-1 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all shadow-sm"
+                                    title="Sign out worker manually"
+                                  >
+                                    Sign Out ⇥
+                                  </button>
+                                </div>
                               ) : (
-                                <span className="inline-flex items-center px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-slate-100 text-slate-600">
-                                  Logged Out
-                                </span>
+                                <div className="flex items-center justify-end gap-2">
+                                  <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-slate-100 text-slate-600">
+                                    Logged Out
+                                  </span>
+                                  <button
+                                    onClick={() => {
+                                      setManualForm({
+                                        record_id: log.id,
+                                        worker_id: log.worker_id,
+                                        date: log.date,
+                                        clock_in: log.clock_in,
+                                        clock_out: log.clock_out || '',
+                                        status: log.status || 'Completed'
+                                      });
+                                      setIsManualModalOpen(true);
+                                    }}
+                                    className="text-slate-400 hover:text-black text-[10px] font-bold uppercase tracking-wider px-2 py-1"
+                                    title="Adjust punch timings"
+                                  >
+                                    Edit ✎
+                                  </button>
+                                </div>
                               )}
                             </td>
                           </tr>
@@ -701,43 +824,73 @@ export default function Home() {
               </div>
             )}
 
-            {/* TAB 2: CALENDAR VIEW & DAILY SHIFT INSPECTOR */}
+            {/* TAB 2: CALENDAR VIEW & INSPECTOR WITH QUICK SWITCH & ADJUST */}
             {adminTab === 'calendar' && (
               <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-8">
                 <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-b border-slate-100 pb-6">
                   <div>
                     <h2 className="text-2xl font-black tracking-tight text-black">Calendar & Daily Shift Inspector</h2>
                     <p className="text-xs text-slate-400 font-semibold mt-0.5">
-                      Select any date and worker to analyze arrival times, tardiness, and daily earnings
+                      Fast-switch between dates and workers to inspect, audit, or adjust shifts
                     </p>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-3 w-full md:w-auto">
-                    <div>
-                      <label className="block text-[9px] font-black uppercase tracking-wider text-slate-400 mb-1">Pick Date</label>
-                      <input
-                        type="date"
-                        value={selectedCalendarDate}
-                        onChange={(e) => setSelectedCalendarDate(e.target.value)}
-                        className="px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold font-mono outline-none focus:border-[#FF6600]"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[9px] font-black uppercase tracking-wider text-slate-400 mb-1">Filter Worker</label>
-                      <select
-                        value={selectedWorkerFilter}
-                        onChange={(e) => setSelectedWorkerFilter(e.target.value)}
-                        className="px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold outline-none focus:border-[#FF6600]"
-                      >
-                        <option value="ALL">All Active Workers ({teamMembers.length})</option>
-                        {teamMembers.map(m => (
-                          <option key={m.id} value={m.user_id}>{m.full_name} (#{m.user_id})</option>
-                        ))}
-                      </select>
-                    </div>
+                  {/* Date & Worker Controls */}
+                  <div className="flex flex-wrap items-center gap-2 w-full md:w-auto">
+                    <button
+                      onClick={() => changeCalendarDateByDays(-1)}
+                      className="px-3 py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-xs font-bold"
+                    >
+                      ← Yesterday
+                    </button>
+                    <button
+                      onClick={() => setSelectedCalendarDate(new Date().toISOString().split('T')[0])}
+                      className="px-3 py-2 bg-orange-50 hover:bg-orange-100 text-[#FF6600] border border-orange-200 rounded-xl text-xs font-bold"
+                    >
+                      Today
+                    </button>
+                    <button
+                      onClick={() => changeCalendarDateByDays(1)}
+                      className="px-3 py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-xs font-bold"
+                    >
+                      Tomorrow →
+                    </button>
+                    <input
+                      type="date"
+                      value={selectedCalendarDate}
+                      onChange={(e) => setSelectedCalendarDate(e.target.value)}
+                      className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold font-mono outline-none focus:border-[#FF6600]"
+                    />
+                    <select
+                      value={selectedWorkerFilter}
+                      onChange={(e) => setSelectedWorkerFilter(e.target.value)}
+                      className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold outline-none focus:border-[#FF6600]"
+                    >
+                      <option value="ALL">All Workers ({teamMembers.length})</option>
+                      {teamMembers.map(m => (
+                        <option key={m.id} value={m.user_id}>{m.full_name}</option>
+                      ))}
+                    </select>
+                    <button
+                      onClick={() => {
+                        setManualForm({
+                          record_id: null,
+                          worker_id: selectedWorkerFilter !== 'ALL' ? selectedWorkerFilter : (teamMembers[0]?.user_id || ''),
+                          date: selectedCalendarDate,
+                          clock_in: '10:00:00 AM',
+                          clock_out: '08:00:00 PM',
+                          status: 'Completed'
+                        });
+                        setIsManualModalOpen(true);
+                      }}
+                      className="bg-[#FF6600] hover:bg-black text-white px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all shadow-sm"
+                    >
+                      + Add Time
+                    </button>
                   </div>
                 </div>
 
+                {/* Day Summary Highlights */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                   <div className="p-5 rounded-2xl bg-slate-50 border border-slate-100">
                     <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Total Shifts</p>
@@ -755,7 +908,7 @@ export default function Home() {
                     <p className="text-[11px] text-slate-400 mt-0.5">Exceeded grace period</p>
                   </div>
                   <div className="p-5 rounded-2xl bg-slate-50 border border-slate-100">
-                    <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Overtime Generated</p>
+                    <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Overtime Logged</p>
                     <p className="text-2xl font-black text-[#FF6600] mt-1">
                       {calendarRecords.reduce((acc, r) => acc + parseFloat(String(r.overtime_hours || 0)), 0).toFixed(1)}h
                     </p>
@@ -773,10 +926,16 @@ export default function Home() {
                   </div>
                 </div>
 
+                {/* Shift Details Grid */}
                 <div className="space-y-4">
-                  <h3 className="text-sm font-black uppercase tracking-wider text-slate-400">
-                    Shift Breakdowns for {selectedCalendarDate}
-                  </h3>
+                  <div className="flex justify-between items-center">
+                    <h3 className="text-sm font-black uppercase tracking-wider text-slate-400">
+                      Shift Details for {selectedCalendarDate}
+                    </h3>
+                    <span className="text-xs font-semibold text-slate-400">
+                      Showing {calendarRecords.length} records
+                    </span>
+                  </div>
 
                   {calendarRecords.length > 0 ? (
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -795,15 +954,34 @@ export default function Home() {
                                 <h4 className="font-black text-base text-black">{record.worker_name || 'Worker'}</h4>
                                 <p className="text-[10px] font-mono text-slate-400">ID: #{record.worker_id} • {record.designations}</p>
                               </div>
-                              {metrics.isLate ? (
-                                <span className="px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-red-50 text-red-600 border border-red-200">
-                                  Late by {metrics.lateMins}m
-                                </span>
-                              ) : (
-                                <span className="px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                  On Schedule
-                                </span>
-                              )}
+                              <div className="flex items-center gap-2">
+                                {metrics.isLate ? (
+                                  <span className="px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-red-50 text-red-600 border border-red-200">
+                                    Late by {metrics.lateMins}m
+                                  </span>
+                                ) : (
+                                  <span className="px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-200">
+                                    On Schedule
+                                  </span>
+                                )}
+                                <button
+                                  onClick={() => {
+                                    setManualForm({
+                                      record_id: record.id,
+                                      worker_id: record.worker_id,
+                                      date: record.date,
+                                      clock_in: record.clock_in,
+                                      clock_out: record.clock_out || '',
+                                      status: record.status || 'Completed'
+                                    });
+                                    setIsManualModalOpen(true);
+                                  }}
+                                  className="text-slate-400 hover:text-black font-bold text-xs"
+                                  title="Edit timing"
+                                >
+                                  ✎
+                                </button>
+                              </div>
                             </div>
 
                             <div className="grid grid-cols-2 gap-3 text-xs bg-slate-50 p-4 rounded-2xl border border-slate-100">
@@ -854,38 +1032,56 @@ export default function Home() {
                       <p className="text-slate-400 text-xs italic">
                         No attendance records logged for {selectedWorkerFilter === 'ALL' ? 'any worker' : `Worker #${selectedWorkerFilter}`} on {selectedCalendarDate}.
                       </p>
+                      <button
+                        onClick={() => {
+                          setManualForm({
+                            record_id: null,
+                            worker_id: selectedWorkerFilter !== 'ALL' ? selectedWorkerFilter : (teamMembers[0]?.user_id || ''),
+                            date: selectedCalendarDate,
+                            clock_in: '10:00:00 AM',
+                            clock_out: '08:00:00 PM',
+                            status: 'Completed'
+                          });
+                          setIsManualModalOpen(true);
+                        }}
+                        className="mt-3 inline-block bg-black hover:bg-[#FF6600] text-white px-4 py-2 rounded-xl text-xs font-bold transition-all"
+                      >
+                        + Add Manual Entry for this Date
+                      </button>
                     </div>
                   )}
                 </div>
               </div>
             )}
 
-            {/* TAB 3: MANAGE STAFF, SHIFT TIMINGS & WAGES (Daily / Hourly / Monthly Options) */}
+            {/* TAB 3: STAFF SHIFT & WAGES CONFIG */}
             {adminTab === 'wages' && (
               <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
                 <div>
                   <h2 className="text-2xl font-black tracking-tight text-black">Worker Shift Timings & Wage Master</h2>
                   <p className="text-xs text-slate-400 font-semibold mt-0.5">
-                    Configure staff on Monthly Salary, Daily Basis, or Per Hour with auto-calculated rates
+                    Define scheduled shift hours, monthly salaries, hourly conversion rates, and late comer penalty rules
                   </p>
                 </div>
 
                 <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse min-w-[850px]">
+                  <table className="w-full text-left border-collapse min-w-[800px]">
                     <thead>
                       <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
                         <th className="pb-3 pl-2">Staff Member</th>
-                        <th className="pb-3">Pay Basis</th>
                         <th className="pb-3">Scheduled Shift</th>
-                        <th className="pb-3">Monthly / Base Wage</th>
-                        <th className="pb-3">Calculated Rate</th>
+                        <th className="pb-3">Monthly Wage</th>
+                        <th className="pb-3">Calculated Hourly</th>
                         <th className="pb-3">OT Multiplier</th>
+                        <th className="pb-3">Grace Period</th>
                         <th className="pb-3 text-right pr-2">Actions</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 text-xs font-semibold">
                       {teamMembers.map(member => {
                         const profile = getWorkerProfile(member.user_id);
+                        const dailyWage = Math.round(profile.monthly_salary / profile.working_days);
+                        const hourly = Math.round(dailyWage / 10);
 
                         return (
                           <tr key={member.id} className="hover:bg-slate-50/70 transition-colors">
@@ -893,31 +1089,23 @@ export default function Home() {
                               <span className="font-bold text-black block">{member.full_name}</span>
                               <span className="font-mono text-[10px] text-slate-400">ID: #{member.user_id} • {member.designations}</span>
                             </td>
-                            <td className="py-4">
-                              <span className={`px-2.5 py-1 rounded-lg text-[10px] font-black uppercase tracking-wider ${
-                                profile.pay_basis === 'monthly' ? 'bg-indigo-50 text-indigo-700 border border-indigo-200' :
-                                profile.pay_basis === 'daily' ? 'bg-amber-50 text-amber-700 border border-amber-200' :
-                                'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                              }`}>
-                                {profile.pay_basis}
-                              </span>
-                            </td>
                             <td className="py-4 font-mono text-slate-700">
                               <span className="px-2.5 py-1 rounded-lg bg-slate-100 font-bold">
                                 {profile.shift_start} - {profile.shift_end}
                               </span>
                             </td>
                             <td className="py-4 font-mono font-bold text-black">
-                              {profile.pay_basis === 'monthly' && `Rs. ${profile.monthly_salary.toLocaleString()} /mo`}
-                              {profile.pay_basis === 'daily' && `Rs. ${profile.daily_wage.toLocaleString()} /day`}
-                              {profile.pay_basis === 'hourly' && `Rs. ${profile.hourly_rate.toLocaleString()} /hr`}
+                              Rs. {profile.monthly_salary.toLocaleString()}
                             </td>
                             <td className="py-4 font-mono text-slate-600">
-                              Rs. {profile.hourly_rate}/hr
-                              <span className="block text-[9px] text-slate-400">Rs. {profile.daily_wage}/day</span>
+                              Rs. {hourly}/hr
+                              <span className="block text-[9px] text-slate-400">Rs. {dailyWage}/day</span>
                             </td>
                             <td className="py-4 font-mono text-[#FF6600] font-bold">
-                              {profile.ot_multiplier}x (Rs. {Math.round(profile.hourly_rate * profile.ot_multiplier)}/h)
+                              {profile.ot_multiplier}x (Rs. {Math.round(hourly * profile.ot_multiplier)}/h)
+                            </td>
+                            <td className="py-4 font-mono text-slate-600">
+                              {profile.grace_period_mins} mins
                             </td>
                             <td className="py-4 pr-2 text-right">
                               <button
@@ -1031,9 +1219,7 @@ export default function Home() {
                         <tr key={row.id} className="hover:bg-slate-50/70 transition-colors">
                           <td className="py-4 pl-2 font-bold text-black">
                             {row.full_name}
-                            <span className="block font-mono text-[10px] text-slate-400">
-                              Base ({row.profile.pay_basis}): Rs. {row.profile.pay_basis === 'monthly' ? row.profile.monthly_salary.toLocaleString() : row.profile.daily_wage.toLocaleString() + '/d'}
-                            </span>
+                            <span className="block font-mono text-[10px] text-slate-400">Base: Rs. {row.profile.monthly_salary.toLocaleString()}</span>
                           </td>
                           <td className="py-4 font-mono text-slate-600">{row.daysWorked} Shifts</td>
                           <td className="py-4 font-mono text-slate-600">{row.regularHours}h (+{row.otHours}h OT)</td>
@@ -1054,7 +1240,7 @@ export default function Home() {
               </div>
             )}
 
-            {/* TAB 6: CLIENT INQUIRIES & LEADS */}
+            {/* TAB 6: CLIENT LEADS */}
             {adminTab === 'leads' && (
               <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
                 <div>
@@ -1114,7 +1300,7 @@ export default function Home() {
               </div>
             )}
 
-            {/* TAB 7: REGISTER STAFF */}
+            {/* TAB 7: REGISTER NEW WORKER */}
             {adminTab === 'register' && (
               <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 max-w-2xl">
                 <div>
@@ -1191,268 +1377,281 @@ export default function Home() {
           </main>
         )}
 
-        {/* ---------------- WORKER DASHBOARD (Enhanced with Full Details) ---------------- */}
-        {userRole === 'worker' && (() => {
-          const workerId = userData?.user_id || String(userData?.id || '');
-          const myLogs = attendanceLogs.filter(l => l.worker_id === workerId);
-          const profile = getWorkerProfile(workerId);
-
-          // Filtering worker logs
-          const filteredLogs = myLogs.filter(l => {
-            const dateStr = normalizeDate(l.date);
-            if (workerHistoryRange === 'month') {
-              const currentMonth = new Date().toISOString().substring(0, 7);
-              return dateStr.startsWith(currentMonth);
-            }
-            if (workerHistoryRange === 'custom' && workerCustomStart && workerCustomEnd) {
-              return dateStr >= workerCustomStart && dateStr <= workerCustomEnd;
-            }
-            return true;
-          });
-
-          let totalReg = 0;
-          let totalOt = 0;
-          let totalDeductions = 0;
-          let totalOtEarned = 0;
-          let netEarned = 0;
-
-          filteredLogs.forEach(l => {
-            const reg = parseFloat(String(l.regular_hours || 0));
-            const ot = parseFloat(String(l.overtime_hours || 0));
-            totalReg += reg;
-            totalOt += ot;
-            const m = calculateShiftMetrics(workerId, l.clock_in, reg, ot);
-            totalDeductions += m.lateDeduction;
-            totalOtEarned += m.otEarned;
-            netEarned += m.netDayPay;
-          });
-
-          return (
-            <main className="max-w-5xl mx-auto px-4 py-12 space-y-8">
-              {/* Profile Card */}
-              <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm flex flex-col sm:flex-row justify-between items-center gap-6">
-                <div className="flex items-center gap-4">
-                  <div className="w-16 h-16 bg-orange-100 text-[#FF6600] rounded-2xl flex items-center justify-center text-3xl font-black">
-                    AF
-                  </div>
-                  <div>
-                    <h2 className="text-2xl font-black text-black">Welcome, {userData?.full_name}</h2>
-                    <p className="text-xs text-slate-400 font-semibold mt-0.5">
-                      {userData?.designation || 'Production Floor'} • ID: #{workerId} • Basis: <span className="uppercase font-bold text-black">{profile.pay_basis}</span>
-                    </p>
-                  </div>
+        {/* ========================================================= */}
+        {/* WORKER DASHBOARD VIEW (WITH DATE SELECTOR & TIMING INSPECTION) */}
+        {/* ========================================================= */}
+        {userRole === 'worker' && (
+          <main className="max-w-5xl mx-auto px-4 py-10 space-y-8 animate-in fade-in duration-300">
+            {/* Worker Welcome Header */}
+            <div className="bg-white p-6 sm:p-8 rounded-3xl border border-slate-200 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+              <div className="flex items-center gap-4">
+                <span className="w-14 h-14 bg-orange-100 text-[#FF6600] rounded-2xl flex items-center justify-center text-2xl font-black">
+                  AF
+                </span>
+                <div>
+                  <h2 className="text-2xl font-black text-black">Welcome back, {userData?.full_name}</h2>
+                  <p className="text-xs text-slate-400 font-semibold mt-0.5">
+                    Worker ID: #{userData?.user_id} • Designation: {userData?.designation || 'Production Floor'}
+                  </p>
                 </div>
-                <a
-                  href="/kiosk"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="bg-[#FF6600] hover:bg-black text-white px-6 py-3.5 rounded-2xl font-black text-xs uppercase tracking-widest transition-all shadow-lg shadow-orange-500/20"
-                >
-                  Open Terminal Gate ↗
-                </a>
               </div>
+              <a
+                href="/kiosk"
+                target="_blank"
+                rel="noreferrer"
+                className="bg-[#FF6600] hover:bg-black text-white px-6 py-3 rounded-xl font-black text-xs uppercase tracking-wider transition-all shadow-md shadow-orange-500/20"
+              >
+                Open Terminal Gate ↗
+              </a>
+            </div>
 
-              {/* Financial & Time Statistics Summary */}
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
-                  <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Total Shifts Logged</p>
-                  <p className="text-3xl font-black text-black mt-2">{filteredLogs.length}</p>
-                  <p className="text-[11px] text-slate-400 mt-1">Within selected range</p>
+            {/* Date Selector & Inspection Card */}
+            <div className="bg-white p-6 sm:p-8 rounded-3xl border border-slate-200 shadow-sm space-y-6">
+              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-b border-slate-100 pb-6">
+                <div>
+                  <h3 className="text-xl font-black text-black">Inspect Shift Details by Date</h3>
+                  <p className="text-xs text-slate-400 font-semibold mt-0.5">
+                    Select any calendar date to review your clock in, clock out, tardiness, and earnings
+                  </p>
                 </div>
-                <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
-                  <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Regular / OT Hours</p>
-                  <p className="text-3xl font-black text-[#FF6600] mt-2">{totalReg.toFixed(1)}h</p>
-                  <p className="text-[11px] text-emerald-600 font-bold mt-1">+{totalOt.toFixed(1)}h Overtime</p>
-                </div>
-                <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
-                  <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Late Deductions</p>
-                  <p className="text-3xl font-black text-red-500 mt-2">-Rs. {totalDeductions.toLocaleString()}</p>
-                  <p className="text-[11px] text-slate-400 mt-1">Grace period: {profile.grace_period_mins}m</p>
-                </div>
-                <div className="bg-black text-white p-6 rounded-3xl shadow-xl flex flex-col justify-between">
-                  <p className="text-[9px] font-black uppercase tracking-widest text-[#FF6600]">Estimated Earnings</p>
-                  <p className="text-3xl font-black font-mono">Rs. {netEarned.toLocaleString()}</p>
-                  <p className="text-[10px] text-slate-400 font-mono">Includes OT & penalties</p>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => {
+                      const d = new Date();
+                      d.setDate(d.getDate() - 1);
+                      setWorkerSelectedDate(d.toISOString().split('T')[0]);
+                    }}
+                    className="px-3 py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-xs font-bold"
+                  >
+                    Yesterday
+                  </button>
+                  <button
+                    onClick={() => setWorkerSelectedDate(new Date().toISOString().split('T')[0])}
+                    className="px-3 py-2 bg-orange-50 hover:bg-orange-100 text-[#FF6600] border border-orange-200 rounded-xl text-xs font-bold"
+                  >
+                    Today
+                  </button>
+                  <input
+                    type="date"
+                    value={workerSelectedDate}
+                    onChange={(e) => setWorkerSelectedDate(e.target.value)}
+                    className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold font-mono outline-none focus:border-[#FF6600]"
+                  />
                 </div>
               </div>
 
-              {/* Attendance Timings & Range Filters */}
-              <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm space-y-6">
-                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-                  <div>
-                    <h3 className="text-xl font-black text-black">My Attendance & Wage Log</h3>
-                    <p className="text-xs text-slate-400 font-semibold mt-0.5">Detailed view of your shifts, timings, and deductions</p>
-                  </div>
+              {/* Day Result Breakdown */}
+              {workerDateRecord ? (() => {
+                const reg = parseFloat(String(workerDateRecord.regular_hours || 0));
+                const ot = parseFloat(String(workerDateRecord.overtime_hours || 0));
+                const metrics = calculateShiftMetrics(workerDateRecord.worker_id, workerDateRecord.clock_in, reg, ot);
 
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      onClick={() => setWorkerHistoryRange('all')}
-                      className={`px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all ${
-                        workerHistoryRange === 'all' ? 'bg-[#FF6600] text-white' : 'bg-slate-100 text-slate-600'
-                      }`}
-                    >
-                      All Time
-                    </button>
-                    <button
-                      onClick={() => setWorkerHistoryRange('month')}
-                      className={`px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all ${
-                        workerHistoryRange === 'month' ? 'bg-[#FF6600] text-white' : 'bg-slate-100 text-slate-600'
-                      }`}
-                    >
-                      This Month
-                    </button>
-                    <button
-                      onClick={() => setWorkerHistoryRange('custom')}
-                      className={`px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all ${
-                        workerHistoryRange === 'custom' ? 'bg-[#FF6600] text-white' : 'bg-slate-100 text-slate-600'
-                      }`}
-                    >
-                      Custom Range
-                    </button>
+                return (
+                  <div className="space-y-6 animate-in zoom-in-95 duration-200">
+                    <div className="flex justify-between items-center">
+                      <span className="font-mono text-xs font-bold text-slate-400">
+                        Date: {workerDateRecord.date}
+                      </span>
+                      {metrics.isLate ? (
+                        <span className="px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-red-50 text-red-600 border border-red-200">
+                          Late Arrival ({metrics.lateMins} mins)
+                        </span>
+                      ) : (
+                        <span className="px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-200">
+                          On Schedule
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                        <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Clock In</p>
+                        <p className="text-xl font-black font-mono text-emerald-600 mt-1">{workerDateRecord.clock_in}</p>
+                      </div>
+                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                        <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Clock Out</p>
+                        <p className="text-xl font-black font-mono text-blue-600 mt-1">{workerDateRecord.clock_out || 'In Shift...'}</p>
+                      </div>
+                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                        <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Hours Logged</p>
+                        <p className="text-xl font-black font-mono text-black mt-1">
+                          {workerDateRecord.clock_out ? `${(reg + ot).toFixed(1)} hrs` : 'In Progress'}
+                        </p>
+                      </div>
+                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                        <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Overtime Logged</p>
+                        <p className="text-xl font-black font-mono text-[#FF6600] mt-1">{ot > 0 ? `+${ot}h` : '0.0h'}</p>
+                      </div>
+                    </div>
+
+                    {/* Financial Summary */}
+                    <div className="p-5 bg-black text-white rounded-2xl flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                      <div>
+                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-[#FF6600]">Estimated Payout for this Date</p>
+                        <p className="text-xs text-slate-400 mt-0.5">
+                          Base Hourly: Rs. {metrics.hourlyRate}/h • OT Rate: Rs. {metrics.otRate}/h
+                        </p>
+                        {metrics.lateDeduction > 0 && (
+                          <p className="text-xs text-red-400 mt-0.5">Late Deduction: -Rs. {metrics.lateDeduction}</p>
+                        )}
+                      </div>
+                      <p className="text-3xl font-black font-mono text-white">
+                        Rs. {metrics.netDayPay.toLocaleString()}
+                      </p>
+                    </div>
                   </div>
+                );
+              })() : (
+                <div className="p-8 text-center bg-slate-50 rounded-2xl border border-dashed border-slate-200">
+                  <p className="text-slate-400 text-xs italic">
+                    No attendance record found for {workerSelectedDate}.
+                  </p>
                 </div>
+              )}
+            </div>
 
-                {workerHistoryRange === 'custom' && (
-                  <div className="flex flex-wrap items-center gap-4 bg-slate-50 p-4 rounded-2xl border border-slate-200">
-                    <div>
-                      <label className="block text-[9px] font-black uppercase text-slate-400 mb-1">Start Date</label>
-                      <input
-                        type="date"
-                        value={workerCustomStart}
-                        onChange={(e) => setWorkerCustomStart(e.target.value)}
-                        className="px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold font-mono"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[9px] font-black uppercase text-slate-400 mb-1">End Date</label>
-                      <input
-                        type="date"
-                        value={workerCustomEnd}
-                        onChange={(e) => setWorkerCustomEnd(e.target.value)}
-                        className="px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold font-mono"
-                      />
-                    </div>
-                  </div>
-                )}
+            {/* Recent 14 Days History Table */}
+            <div className="bg-white p-6 sm:p-8 rounded-3xl border border-slate-200 shadow-sm space-y-6">
+              <h3 className="text-xl font-black text-black">My Recent Shift Logs</h3>
 
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse min-w-[700px]">
-                    <thead>
-                      <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
-                        <th className="pb-3 pl-2">Date</th>
-                        <th className="pb-3">Clock In</th>
-                        <th className="pb-3">Clock Out</th>
-                        <th className="pb-3">Hours (Reg + OT)</th>
-                        <th className="pb-3">Late Penalty</th>
-                        <th className="pb-3 text-right pr-2">Net Shift Pay</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100 text-xs font-semibold">
-                      {filteredLogs.map(log => {
-                        const reg = parseFloat(String(log.regular_hours || 0));
-                        const ot = parseFloat(String(log.overtime_hours || 0));
-                        const m = calculateShiftMetrics(workerId, log.clock_in, reg, ot);
-
-                        return (
-                          <tr key={log.id} className="hover:bg-slate-50/70 transition-colors">
-                            <td className="py-4 pl-2 font-mono font-bold text-black">{normalizeDate(log.date)}</td>
-                            <td className="py-4 font-mono font-bold text-emerald-600">{log.clock_in}</td>
-                            <td className="py-4 font-mono font-bold text-blue-600">{log.clock_out || 'Active Shift'}</td>
-                            <td className="py-4 font-mono text-slate-600">
-                              {log.clock_out ? `${(reg + ot).toFixed(1)}h (${reg}h + ${ot}h OT)` : 'In Progress'}
-                            </td>
-                            <td className="py-4 font-mono text-red-500 font-bold">
-                              {m.lateDeduction > 0 ? `-Rs. ${m.lateDeduction} (${m.lateMins}m late)` : 'None'}
-                            </td>
-                            <td className="py-4 pr-2 text-right font-mono font-black text-black">
-                              Rs. {m.netDayPay.toLocaleString()}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                      {filteredLogs.length === 0 && (
-                        <tr>
-                          <td colSpan={6} className="py-12 text-center text-slate-400 italic">
-                            No attendance records found for the selected range.
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse min-w-[650px]">
+                  <thead>
+                    <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
+                      <th className="pb-3 pl-2">Date</th>
+                      <th className="pb-3">Clock In</th>
+                      <th className="pb-3">Clock Out</th>
+                      <th className="pb-3">Total Hours</th>
+                      <th className="pb-3">Overtime</th>
+                      <th className="pb-3 text-right pr-2">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 text-xs font-semibold">
+                    {workerPersonalLogs.slice(0, 14).map(log => {
+                      const reg = parseFloat(String(log.regular_hours || 0));
+                      const ot = parseFloat(String(log.overtime_hours || 0));
+                      return (
+                        <tr key={log.id} className="hover:bg-slate-50/70 transition-colors">
+                          <td className="py-4 pl-2 font-mono font-bold text-black">{log.date}</td>
+                          <td className="py-4 font-mono text-emerald-600 font-bold">{log.clock_in}</td>
+                          <td className="py-4 font-mono text-blue-600 font-bold">{log.clock_out || '—'}</td>
+                          <td className="py-4 font-mono text-slate-600">{log.clock_out ? `${(reg + ot).toFixed(1)}h` : 'Active'}</td>
+                          <td className="py-4 font-mono text-[#FF6600] font-bold">{ot > 0 ? `+${ot}h` : '—'}</td>
+                          <td className="py-4 pr-2 text-right">
+                            {!log.clock_out ? (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase bg-emerald-50 text-emerald-700 border border-emerald-200">
+                                In Shift
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-black uppercase bg-slate-100 text-slate-600">
+                                Completed
+                              </span>
+                            )}
                           </td>
                         </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </div>
-            </main>
-          );
-        })()}
+            </div>
+          </main>
+        )}
 
-        {/* ---------------- MANUAL ADMIN PUNCH MODAL ---------------- */}
-        {isManualPunchOpen && (
-          <div className="fixed inset-0 z-[7000] flex items-center justify-center bg-black/75 backdrop-blur-md p-4">
-            <div className="bg-white rounded-3xl max-w-md w-full p-8 shadow-2xl relative border border-slate-200 animate-in zoom-in-95">
+        {/* ========================================================= */}
+        {/* MANUAL ADJUST / ADD TIME MODAL (ADMIN) */}
+        {/* ========================================================= */}
+        {isManualModalOpen && (
+          <div className="fixed inset-0 z-[7500] flex items-center justify-center bg-black/75 backdrop-blur-md p-4">
+            <div className="bg-white rounded-3xl max-w-lg w-full p-8 shadow-2xl relative border border-slate-200 animate-in zoom-in-95">
               <button
-                onClick={() => setIsManualPunchOpen(false)}
+                onClick={() => setIsManualModalOpen(false)}
                 className="absolute top-6 right-6 text-slate-400 hover:text-black font-bold text-lg"
               >
                 ✕
               </button>
 
-              <h3 className="text-xl font-black text-black">Manual Member Sign In/Out</h3>
+              <h3 className="text-xl font-black text-black">
+                {manualForm.record_id ? 'Adjust Shift Timing' : 'Manually Add Shift Punch'}
+              </h3>
               <p className="text-xs text-slate-400 font-semibold mt-1">
-                Admin override to manually log attendance for any worker
+                Save attendance corrections directly to the database
               </p>
 
-              <form onSubmit={handleManualPunchSubmit} className="space-y-4 mt-6 text-xs">
+              <form onSubmit={handleSaveManualRecord} className="space-y-4 mt-6 text-xs">
                 <div>
-                  <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Select Worker</label>
+                  <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Select Employee</label>
                   <select
-                    value={manualWorkerId}
-                    onChange={(e) => setManualWorkerId(e.target.value)}
-                    required
-                    className="w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none focus:border-[#FF6600]"
+                    value={manualForm.worker_id}
+                    onChange={(e) => setManualForm({ ...manualForm, worker_id: e.target.value })}
+                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-bold"
                   >
-                    <option value="">-- Choose Team Member --</option>
                     {teamMembers.map(m => (
-                      <option key={m.id} value={m.user_id}>{m.full_name} (#{m.user_id}) - {m.designations || m.role}</option>
+                      <option key={m.id} value={m.user_id}>{m.full_name} (#{m.user_id})</option>
                     ))}
                   </select>
                 </div>
 
                 <div>
-                  <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Action Type</label>
-                  <div className="grid grid-cols-2 gap-3">
-                    <button
-                      type="button"
-                      onClick={() => setManualAction('in')}
-                      className={`py-3 rounded-xl font-black uppercase tracking-wider transition-all border ${
-                        manualAction === 'in' ? 'bg-emerald-600 text-white border-emerald-600 shadow-md' : 'bg-slate-50 text-slate-600 border-slate-200'
-                      }`}
-                    >
-                      Clock In
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setManualAction('out')}
-                      className={`py-3 rounded-xl font-black uppercase tracking-wider transition-all border ${
-                        manualAction === 'out' ? 'bg-blue-600 text-white border-blue-600 shadow-md' : 'bg-slate-50 text-slate-600 border-slate-200'
-                      }`}
-                    >
-                      Clock Out
-                    </button>
+                  <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Shift Date</label>
+                  <input
+                    type="date"
+                    value={manualForm.date}
+                    onChange={(e) => setManualForm({ ...manualForm, date: e.target.value })}
+                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Clock In Time</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. 10:15:00 AM"
+                      value={manualForm.clock_in}
+                      onChange={(e) => setManualForm({ ...manualForm, clock_in: e.target.value })}
+                      className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
+                    />
                   </div>
+                  <div>
+                    <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Clock Out Time</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. 08:30:00 PM"
+                      value={manualForm.clock_out}
+                      onChange={(e) => setManualForm({ ...manualForm, clock_out: e.target.value })}
+                      className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Status</label>
+                  <select
+                    value={manualForm.status}
+                    onChange={(e) => setManualForm({ ...manualForm, status: e.target.value })}
+                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-bold"
+                  >
+                    <option value="Completed">Completed</option>
+                    <option value="Active">Active (In Shift)</option>
+                    <option value="Late">Late Arrival</option>
+                    <option value="Excused">Excused</option>
+                  </select>
                 </div>
 
                 <button
                   type="submit"
                   className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest transition-all shadow-md shadow-orange-500/20"
                 >
-                  Execute Manual {manualAction === 'in' ? 'Clock In' : 'Clock Out'}
+                  Save Shift Punch →
                 </button>
               </form>
             </div>
           </div>
         )}
 
-        {/* ---------------- WAGE PROFILE CONFIG MODAL (Daily / Hourly / Monthly Options) ---------------- */}
+        {/* ---------------- WAGE PROFILE CONFIG MODAL ---------------- */}
         {editingWageWorker && (
           <div className="fixed inset-0 z-[7000] flex items-center justify-center bg-black/75 backdrop-blur-md p-4">
             <div className="bg-white rounded-3xl max-w-lg w-full p-8 shadow-2xl relative border border-slate-200 animate-in zoom-in-95">
@@ -1481,26 +1680,13 @@ export default function Home() {
                 }}
                 className="space-y-4 mt-6 text-xs"
               >
-                <div>
-                  <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Pay Basis Selection</label>
-                  <select
-                    value={wageFormState.pay_basis}
-                    onChange={(e) => updateWageForm({ pay_basis: e.target.value as any })}
-                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none focus:border-[#FF6600]"
-                  >
-                    <option value="monthly">Monthly Salary Based</option>
-                    <option value="daily">Daily Wage Basis</option>
-                    <option value="hourly">Per Hour Rate Basis</option>
-                  </select>
-                </div>
-
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Shift Start Time</label>
                     <input
                       type="time"
                       value={wageFormState.shift_start}
-                      onChange={(e) => updateWageForm({ shift_start: e.target.value })}
+                      onChange={(e) => setWageFormState({ ...wageFormState, shift_start: e.target.value })}
                       className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                     />
                   </div>
@@ -1509,7 +1695,7 @@ export default function Home() {
                     <input
                       type="time"
                       value={wageFormState.shift_end}
-                      onChange={(e) => updateWageForm({ shift_end: e.target.value })}
+                      onChange={(e) => setWageFormState({ ...wageFormState, shift_end: e.target.value })}
                       className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                     />
                   </div>
@@ -1517,21 +1703,11 @@ export default function Home() {
 
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
-                      {wageFormState.pay_basis === 'monthly' ? 'Monthly Salary (PKR)' : wageFormState.pay_basis === 'daily' ? 'Daily Wage (PKR)' : 'Hourly Rate (PKR)'}
-                    </label>
+                    <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Monthly Salary (PKR)</label>
                     <input
                       type="number"
-                      value={
-                        wageFormState.pay_basis === 'monthly' ? wageFormState.monthly_salary :
-                        wageFormState.pay_basis === 'daily' ? wageFormState.daily_wage : wageFormState.hourly_rate
-                      }
-                      onChange={(e) => {
-                        const val = Number(e.target.value);
-                        if (wageFormState.pay_basis === 'monthly') updateWageForm({ monthly_salary: val });
-                        else if (wageFormState.pay_basis === 'daily') updateWageForm({ daily_wage: val });
-                        else updateWageForm({ hourly_rate: val });
-                      }}
+                      value={wageFormState.monthly_salary}
+                      onChange={(e) => setWageFormState({ ...wageFormState, monthly_salary: Number(e.target.value) })}
                       className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                     />
                   </div>
@@ -1540,7 +1716,7 @@ export default function Home() {
                     <input
                       type="number"
                       value={wageFormState.working_days}
-                      onChange={(e) => updateWageForm({ working_days: Number(e.target.value) })}
+                      onChange={(e) => setWageFormState({ ...wageFormState, working_days: Number(e.target.value) })}
                       className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                     />
                   </div>
@@ -1553,7 +1729,7 @@ export default function Home() {
                       type="number"
                       step="0.1"
                       value={wageFormState.ot_multiplier}
-                      onChange={(e) => updateWageForm({ ot_multiplier: Number(e.target.value) })}
+                      onChange={(e) => setWageFormState({ ...wageFormState, ot_multiplier: Number(e.target.value) })}
                       className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                     />
                   </div>
@@ -1562,20 +1738,22 @@ export default function Home() {
                     <input
                       type="number"
                       value={wageFormState.grace_period_mins}
-                      onChange={(e) => updateWageForm({ grace_period_mins: Number(e.target.value) })}
+                      onChange={(e) => setWageFormState({ ...wageFormState, grace_period_mins: Number(e.target.value) })}
                       className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                     />
                   </div>
                 </div>
 
-                {/* Calculation Preview */}
                 <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200 font-mono text-[11px] space-y-1">
-                  <p className="text-slate-500 font-bold uppercase tracking-wider text-[9px]">Auto-Calculated Rates:</p>
-                  <p className="text-black">Monthly: <strong>Rs. {wageFormState.monthly_salary.toLocaleString()}</strong></p>
-                  <p className="text-black">Daily Wage: <strong>Rs. {wageFormState.daily_wage.toLocaleString()}</strong></p>
-                  <p className="text-black">Hourly Wage: <strong>Rs. {wageFormState.hourly_rate}/hr</strong></p>
+                  <p className="text-slate-500 font-bold uppercase tracking-wider text-[9px]">Rate Projections:</p>
+                  <p className="text-black">
+                    Daily Wage: <strong>Rs. {Math.round(wageFormState.monthly_salary / wageFormState.working_days)}</strong>
+                  </p>
+                  <p className="text-black">
+                    Hourly Wage (10h shift): <strong>Rs. {Math.round((wageFormState.monthly_salary / wageFormState.working_days) / 10)}/h</strong>
+                  </p>
                   <p className="text-[#FF6600]">
-                    Late Penalty Rate: <strong>Rs. {(wageFormState.hourly_rate / 60).toFixed(2)}/min</strong> after {wageFormState.grace_period_mins}m grace
+                    Late Penalty Rate: <strong>Rs. {((Math.round((wageFormState.monthly_salary / wageFormState.working_days) / 10)) / 60).toFixed(2)}/min</strong> after {wageFormState.grace_period_mins}m grace
                   </p>
                 </div>
 
@@ -1713,6 +1891,7 @@ export default function Home() {
   // =============================================================
   return (
     <main className="min-h-screen bg-white font-sans text-[#111827] antialiased selection:bg-[#FF6600] selection:text-white">
+      {/* Top Brand Navigation */}
       <nav className="sticky top-0 z-50 bg-white/90 backdrop-blur-md border-b border-slate-100">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex justify-between items-center">
           <div className="flex items-center gap-3">
@@ -1734,7 +1913,6 @@ export default function Home() {
             <a href="#services" className="hover:text-[#FF6600] transition-colors">Services</a>
             <a href="#calculator" className="hover:text-[#FF6600] transition-colors">Estimator</a>
             <a href="#about" className="hover:text-[#FF6600] transition-colors">Studio & Plant</a>
-            <a href="#contact" className="hover:text-[#FF6600] transition-colors">Contact</a>
           </div>
 
           <div className="flex items-center gap-3">
@@ -1810,7 +1988,7 @@ export default function Home() {
             </div>
 
             <div className="lg:col-span-5 grid grid-cols-2 gap-4">
-              <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-xl shadow-slate-200/50 space-y-3">
+              <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-xl space-y-3">
                 <span className="text-3xl">🖨️</span>
                 <h3 className="font-black text-sm uppercase text-black">Offset & Digital</h3>
                 <p className="text-[11px] text-slate-500 leading-relaxed">High-speed Heidelberg & digital production for commercial books and packaging.</p>
@@ -1825,7 +2003,7 @@ export default function Home() {
                 <h3 className="font-black text-sm uppercase text-[#FF6600]">Smart PVC Cards</h3>
                 <p className="text-[11px] text-slate-600 leading-relaxed">RFID 10-digit chip attendance badges paired with instant terminal gate check-in.</p>
               </div>
-              <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-xl shadow-slate-200/50 space-y-3 mt-6">
+              <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-xl space-y-3 mt-6">
                 <span className="text-3xl">🏛️</span>
                 <h3 className="font-black text-sm uppercase text-black">Flex Signage</h3>
                 <p className="text-[11px] text-slate-500 leading-relaxed">Wide-format Panaflex billboards, acrylic displays, and retail vinyl wrapping.</p>
@@ -1846,7 +2024,7 @@ export default function Home() {
               </h2>
             </div>
             <p className="text-xs font-bold uppercase tracking-wider text-slate-400 max-w-xs">
-              Every stage handled in-house from design layout to heavy production and digital delivery.
+              Handled in-house from design layout to heavy production and digital delivery.
             </p>
           </div>
 
@@ -1877,8 +2055,7 @@ export default function Home() {
                   onClick={() => setIsProjectModalOpen(true)}
                   className="mt-6 text-[10px] font-black uppercase tracking-widest text-[#FF6600] group-hover:text-black flex items-center gap-1 transition-colors"
                 >
-                  <span>Inquire Specifications</span>
-                  <span>→</span>
+                  <span>Inquire Specifications →</span>
                 </button>
               </div>
             ))}
@@ -1886,12 +2063,10 @@ export default function Home() {
         </div>
       </section>
 
-      {/* Instant Rate Estimator */}
+      {/* Calculator Section */}
       <section id="calculator" className="py-24 bg-white border-b border-slate-100">
         <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="bg-black text-white rounded-[40px] p-8 sm:p-14 shadow-2xl relative overflow-hidden">
-            <div className="absolute top-0 right-0 w-96 h-96 bg-[#FF6600]/20 rounded-full blur-3xl pointer-events-none" />
-
             <div className="relative z-10 space-y-8">
               <div>
                 <span className="text-[10px] font-black uppercase tracking-[0.3em] text-[#FF6600]">Live Estimator</span>
@@ -1948,8 +2123,6 @@ export default function Home() {
                   <p className="text-4xl sm:text-5xl font-black text-[#FF6600] font-mono">
                     Rs. {calculatedEstimate.toLocaleString()}
                   </p>
-                  <p className="text-[11px] text-slate-400">Excluding delivery • Standard turnaround</p>
-
                   <a
                     href={`https://wa.me/923325327333?text=Salam%20Al%20Fareed,%20I%20want%20to%20place%20an%20order%20for%20${calcQuantity}%20units%20of%20${calcService}%20(Estimated%20Rs.%20${calculatedEstimate})`}
                     target="_blank"
@@ -1965,7 +2138,7 @@ export default function Home() {
         </div>
       </section>
 
-      {/* About Plant */}
+      {/* Production Plant & Contacts */}
       <section id="about" className="py-24 bg-slate-50 border-b border-slate-100">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="grid lg:grid-cols-2 gap-12 items-center">
@@ -1977,59 +2150,91 @@ export default function Home() {
               <p className="text-slate-600 font-medium leading-relaxed text-sm sm:text-base">
                 Operating directly out of Johar Mor on Rashid Minhas Road, Al Fareed combines heavy industrial copiers, digital presses, bindery stations, and an in-house software engineering team to fulfill enterprise orders with zero subcontracting delay.
               </p>
-
-              <div className="space-y-3 pt-2">
-                <div className="flex items-center gap-3">
-                  <span className="text-[#FF6600] font-black">✓</span>
-                  <span className="text-xs font-bold text-slate-700">Offset & High-Speed Digital Presses</span>
-                </div>
-                <div className="flex items-center gap-3">
-                  <span className="text-[#FF6600] font-black">✓</span>
-                  <span className="text-xs font-bold text-slate-700">Konica Minolta High-Volume Duplicators</span>
-                </div>
-                <div className="flex items-center gap-3">
-                  <span className="text-[#FF6600] font-black">✓</span>
-                  <span className="text-xs font-bold text-slate-700">Dedicated Jameel Noori Nastaleeq Urdu Composing Desks</span>
-                </div>
-                <div className="flex items-center gap-3">
-                  <span className="text-[#FF6600] font-black">✓</span>
-                  <span className="text-xs font-bold text-slate-700">24/7 NFC Terminal Gate Monitoring</span>
-                </div>
-              </div>
             </div>
 
-            <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-xl space-y-6">
-              <h3 className="text-xl font-black text-black uppercase tracking-tight">Direct Studio Contacts</h3>
-              
-              <div className="space-y-4 text-xs font-semibold">
-                <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex items-start gap-4">
-                  <span className="text-2xl">📍</span>
-                  <div>
-                    <p className="font-black text-black uppercase">Karachi Headquarters</p>
-                    <p className="text-slate-500 mt-0.5">Shop # 21, Empire Centre, Johar Mor, Rashid Minhas Road, Karachi, Pakistan.</p>
-                  </div>
+            <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-xl space-y-4 text-xs font-semibold">
+              <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex items-start gap-4">
+                <span className="text-2xl">📍</span>
+                <div>
+                  <p className="font-black text-black uppercase">Karachi Headquarters</p>
+                  <p className="text-slate-500 mt-0.5">Shop # 21, Empire Centre, Johar Mor, Rashid Minhas Road, Karachi, Pakistan.</p>
                 </div>
-
-                <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex items-start gap-4">
-                  <span className="text-2xl">📞</span>
-                  <div>
-                    <p className="font-black text-black uppercase">Direct Production Hotline</p>
-                    <p className="text-slate-500 mt-0.5">0310-2828228 • 0332-5327333</p>
-                  </div>
-                </div>
-
-                <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex items-start gap-4">
-                  <span className="text-2xl">✉️</span>
-                  <div>
-                    <p className="font-black text-black uppercase">Official Communications</p>
-                    <p className="text-slate-500 mt-0.5">info@alfareed.pk</p>
-                  </div>
+              </div>
+              <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex items-start gap-4">
+                <span className="text-2xl">📞</span>
+                <div>
+                  <p className="font-black text-black uppercase">Hotline & Inquiries</p>
+                  <p className="text-slate-500 mt-0.5">0310-2828228 • 0332-5327333</p>
                 </div>
               </div>
             </div>
           </div>
         </div>
       </section>
+
+      {/* Project Inquiry Modal */}
+      {isProjectModalOpen && (
+        <div className="fixed inset-0 z-[6000] flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
+          <div className="bg-white rounded-3xl max-w-lg w-full p-8 shadow-2xl relative border border-slate-200 animate-in zoom-in-95">
+            <button
+              onClick={() => setIsProjectModalOpen(false)}
+              className="absolute top-6 right-6 text-slate-400 hover:text-black font-bold text-lg"
+            >
+              ✕
+            </button>
+            <h3 className="text-2xl font-black text-black uppercase tracking-tight">Submit Project Brief</h3>
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                const formData = new FormData(e.currentTarget);
+                const payload = Object.fromEntries(formData);
+                try {
+                  const res = await fetch('/api/projects/submit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                  });
+                  if (res.ok) {
+                    alert('Project Brief Transmitted Successfully!');
+                    setIsProjectModalOpen(false);
+                  }
+                } catch (err) {
+                  alert('Transmission saved!');
+                  setIsProjectModalOpen(false);
+                }
+              }}
+              className="space-y-4 mt-6"
+            >
+              <div>
+                <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Client Name</label>
+                <input name="client_name" required placeholder="Your Name or Company" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Service</label>
+                  <select name="service_type" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]">
+                    <option value="Printing">Printing & Packaging</option>
+                    <option value="Composing">Urdu / Legal Composing</option>
+                    <option value="Smart Cards">Smart PVC / NFC Badges</option>
+                    <option value="Binding">Luxury Binding & Finishing</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Phone</label>
+                  <input name="phone" required placeholder="0300-1234567" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
+                </div>
+              </div>
+              <div>
+                <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Requirements</label>
+                <textarea name="description" required rows={3} placeholder="Specs, quantity, deadline..." className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold outline-none focus:border-[#FF6600]" />
+              </div>
+              <button type="submit" className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest transition-all">
+                Transmit Brief →
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Login Modal */}
       {isLoginOpen && (
@@ -2044,24 +2249,21 @@ export default function Home() {
             >
               ✕
             </button>
-
             <div className="text-center mb-6">
               <span className="w-12 h-12 bg-black text-[#FF6600] rounded-2xl flex items-center justify-center mx-auto text-xl font-black mb-3">
                 AF
               </span>
               <h3 className="text-2xl font-black text-black uppercase tracking-tight">System Access</h3>
-              <p className="text-xs text-slate-400 font-semibold mt-1">Enter your assigned terminal credentials</p>
+              <p className="text-xs text-slate-400 font-semibold mt-1">Enter your terminal credentials</p>
             </div>
-
             {loginError && (
               <div className="p-3 mb-4 rounded-xl bg-red-50 border border-red-200 text-red-600 text-xs font-bold text-center">
                 {loginError}
               </div>
             )}
-
             <form onSubmit={handleLogin} className="space-y-4">
               <div>
-                <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Worker User ID</label>
+                <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Worker User ID</label>
                 <input
                   type="text"
                   required
@@ -2071,9 +2273,8 @@ export default function Home() {
                   className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold outline-none focus:border-[#FF6600]"
                 />
               </div>
-
               <div>
-                <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Secure Password</label>
+                <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">Password</label>
                 <input
                   name="password"
                   type="password"
@@ -2082,7 +2283,6 @@ export default function Home() {
                   className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold outline-none focus:border-[#FF6600]"
                 />
               </div>
-
               <button
                 type="submit"
                 className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest transition-all shadow-md shadow-orange-500/20"
