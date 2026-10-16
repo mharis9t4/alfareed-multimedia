@@ -3,43 +3,57 @@ import { db } from '@/lib/db';
 
 export async function GET() {
   try {
-    // Select all available columns from attendance and join with users table
     const [rows]: any = await db.execute(`
       SELECT 
-        a.*,
+        a.id,
+        CAST(a.worker_id AS CHAR) AS worker_id,
+        COALESCE(
+          DATE_FORMAT(a.date, '%Y-%m-%d'), 
+          DATE_FORMAT(a.created_at, '%Y-%m-%d')
+        ) AS date,
+        a.clock_in,
+        a.clock_out,
+        a.status,
+        a.regular_hours,
+        a.overtime_hours,
+        a.created_at,
         u.full_name AS worker_name,
         u.designations
       FROM attendance a
-      LEFT JOIN users u ON (a.worker_id = u.user_id OR CAST(a.worker_id AS CHAR) = CAST(u.id AS CHAR))
+      LEFT JOIN users u ON (
+        CAST(a.worker_id AS CHAR) = CAST(u.user_id AS CHAR) 
+        OR CAST(a.worker_id AS CHAR) = CAST(u.id AS CHAR)
+      )
       ORDER BY a.id DESC
-      LIMIT 150
+      LIMIT 250
     `);
 
-    // Standardize field names to guarantee compatibility with the frontend dashboard
+    // Standardize each record so the frontend date filter matches accurately
     const normalizedRows = (rows || []).map((row: any) => {
-      const rawClockIn = row.clock_in || row.check_in || '—';
-      const rawClockOut = row.clock_out || row.check_out || null;
-      const regHours = parseFloat(String(row.regular_hours || row.reg_hrs || row.hours || 0));
-      const otHours = parseFloat(String(row.overtime_hours || row.overtime_hrs || row.ot_hours || 0));
-
-      let recordDate = row.date;
-      if (!recordDate && row.created_at) {
-        recordDate = new Date(row.created_at).toISOString().split('T')[0];
-      } else if (!recordDate) {
-        recordDate = new Date().toISOString().split('T')[0];
+      let dateStr = '';
+      if (row.date) {
+        const s = String(row.date);
+        const match = s.match(/^(\d{4}-\d{2}-\d{2})/);
+        dateStr = match ? match[1] : s.split('T')[0].split(' ')[0].trim();
+      } else if (row.created_at) {
+        const s = String(row.created_at);
+        const match = s.match(/^(\d{4}-\d{2}-\d{2})/);
+        dateStr = match ? match[1] : new Date(row.created_at).toISOString().split('T')[0];
+      } else {
+        dateStr = new Date().toISOString().split('T')[0];
       }
 
       return {
         id: row.id,
-        worker_id: String(row.worker_id || ''),
+        worker_id: String(row.worker_id || '').trim(),
         worker_name: row.worker_name || `Worker #${row.worker_id}`,
         designations: row.designations || 'Team Member',
-        date: String(recordDate),
-        clock_in: String(rawClockIn),
-        clock_out: rawClockOut ? String(rawClockOut) : null,
-        status: row.status || (rawClockOut ? 'Completed' : 'Active'),
-        regular_hours: isNaN(regHours) ? 0 : regHours,
-        overtime_hours: isNaN(otHours) ? 0 : otHours,
+        date: dateStr,
+        clock_in: String(row.clock_in || '—'),
+        clock_out: row.clock_out ? String(row.clock_out) : null,
+        status: row.status || (row.clock_out ? 'Completed' : 'Active'),
+        regular_hours: parseFloat(String(row.regular_hours || 0)),
+        overtime_hours: parseFloat(String(row.overtime_hours || 0)),
         created_at: row.created_at || null
       };
     });
