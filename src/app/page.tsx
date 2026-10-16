@@ -287,25 +287,27 @@ export default function Home() {
 
   const calculateShiftMetrics = (workerId: string, clockInStr: string, regHours: number, otHours: number) => {
     const profile = getWorkerProfile(workerId);
-    const [schedH, schedM] = profile.shift_start.split(':').map(Number);
+    const [schedH, schedM] = (profile.shift_start || '10:00').split(':').map(Number);
     
     let actualMinutes = 0;
-    const timeMatch = clockInStr.match(/(\d+):(\d+)(?::(\d+))?\s*(AM|PM)?/i);
-    if (timeMatch) {
-      let h = parseInt(timeMatch[1], 10);
-      const m = parseInt(timeMatch[2], 10);
-      const mer = timeMatch[4] ? timeMatch[4].toUpperCase() : null;
-      if (mer === 'PM' && h < 12) h += 12;
-      if (mer === 'AM' && h === 12) h = 0;
-      actualMinutes = h * 60 + m;
+    if (clockInStr && typeof clockInStr === 'string') {
+      const timeMatch = clockInStr.match(/(\d+):(\d+)(?::(\d+))?\s*(AM|PM)?/i);
+      if (timeMatch) {
+        let h = parseInt(timeMatch[1], 10);
+        const m = parseInt(timeMatch[2], 10);
+        const mer = timeMatch[4] ? timeMatch[4].toUpperCase() : null;
+        if (mer === 'PM' && h < 12) h += 12;
+        if (mer === 'AM' && h === 12) h = 0;
+        actualMinutes = h * 60 + m;
+      }
     }
 
-    const scheduledMinutes = schedH * 60 + schedM;
+    const scheduledMinutes = schedH * 60 + (schedM || 0);
     const diffMinutes = actualMinutes > 0 ? actualMinutes - scheduledMinutes : 0;
     const isLate = diffMinutes > profile.grace_period_mins;
     const lateMins = isLate ? diffMinutes : 0;
 
-    const dailyWage = Math.round(profile.monthly_salary / profile.working_days);
+    const dailyWage = Math.round(profile.monthly_salary / (profile.working_days || 26));
     const hourlyRate = Math.round(dailyWage / 10);
     const minuteRate = hourlyRate / 60;
     
@@ -395,13 +397,17 @@ export default function Home() {
   };
 
   const changeCalendarDateByDays = (days: number) => {
-    const current = new Date(selectedCalendarDate);
+    const parts = selectedCalendarDate.split('-').map(Number);
+    const current = new Date(parts[0], parts[1] - 1, parts[2]);
     current.setDate(current.getDate() + days);
-    setSelectedCalendarDate(current.toISOString().split('T')[0]);
+    const nextY = current.getFullYear();
+    const nextM = String(current.getMonth() + 1).padStart(2, '0');
+    const nextD = String(current.getDate()).padStart(2, '0');
+    setSelectedCalendarDate(`${nextY}-${nextM}-${nextD}`);
   };
 
   // -------------------------------------------------------------
-  // DYNAMIC DERIVED DATA
+  // DYNAMIC DERIVED DATA & FILTERS
   // -------------------------------------------------------------
   const activeStaffCount = useMemo(() => {
     return attendanceLogs.filter(log => !log.clock_out).length;
@@ -424,11 +430,19 @@ export default function Home() {
     return (rates[calcService] || 10) * Math.max(1, calcQuantity);
   }, [calcService, calcQuantity]);
 
-  // Calendar filtered records
+  // Calendar filtered records: strictly sanitizes both date and worker_id
   const calendarRecords = useMemo(() => {
     return attendanceLogs.filter(log => {
-      const matchesDate = log.date === selectedCalendarDate;
-      const matchesWorker = selectedWorkerFilter === 'ALL' || log.worker_id === selectedWorkerFilter;
+      // Extract pure YYYY-MM-DD
+      const rawLogDate = log.date ? (String(log.date).match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || String(log.date).split('T')[0].split(' ')[0].trim()) : '';
+      const targetDate = String(selectedCalendarDate || '').trim();
+      const matchesDate = rawLogDate === targetDate;
+
+      // Extract worker string
+      const logWorkerId = String(log.worker_id || '').trim();
+      const targetWorker = String(selectedWorkerFilter || '').trim();
+      const matchesWorker = targetWorker === 'ALL' || logWorkerId === targetWorker;
+
       return matchesDate && matchesWorker;
     });
   }, [attendanceLogs, selectedCalendarDate, selectedWorkerFilter]);
@@ -436,7 +450,7 @@ export default function Home() {
   // Overall Payroll Summary
   const payrollSummary = useMemo(() => {
     return teamMembers.map(member => {
-      const logs = attendanceLogs.filter(l => l.worker_id === member.user_id);
+      const logs = attendanceLogs.filter(l => String(l.worker_id).trim() === String(member.user_id).trim());
       const days = logs.length;
       let totalRegHours = 0;
       let totalOtHours = 0;
@@ -474,11 +488,15 @@ export default function Home() {
   // Worker's personal data filter
   const workerPersonalLogs = useMemo(() => {
     if (!userData?.user_id) return [];
-    return attendanceLogs.filter(l => l.worker_id === userData.user_id);
+    const myId = String(userData.user_id).trim();
+    return attendanceLogs.filter(l => String(l.worker_id).trim() === myId);
   }, [attendanceLogs, userData]);
 
   const workerDateRecord = useMemo(() => {
-    return workerPersonalLogs.find(l => l.date === workerSelectedDate);
+    return workerPersonalLogs.find(l => {
+      const rawDate = l.date ? (String(l.date).match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || String(l.date).split('T')[0].split(' ')[0].trim()) : '';
+      return rawDate === String(workerSelectedDate || '').trim();
+    });
   }, [workerPersonalLogs, workerSelectedDate]);
 
   // -------------------------------------------------------------
@@ -824,7 +842,7 @@ export default function Home() {
               </div>
             )}
 
-            {/* TAB 2: CALENDAR VIEW & INSPECTOR WITH QUICK SWITCH & ADJUST */}
+            {/* TAB 2: CALENDAR VIEW & INSPECTOR WITH SANITIZED DATE / WORKER MATCHING */}
             {adminTab === 'calendar' && (
               <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-8">
                 <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-b border-slate-100 pb-6">
@@ -868,7 +886,7 @@ export default function Home() {
                     >
                       <option value="ALL">All Workers ({teamMembers.length})</option>
                       {teamMembers.map(m => (
-                        <option key={m.id} value={m.user_id}>{m.full_name}</option>
+                        <option key={m.id} value={String(m.user_id).trim()}>{m.full_name}</option>
                       ))}
                     </select>
                     <button
@@ -1378,7 +1396,7 @@ export default function Home() {
         )}
 
         {/* ========================================================= */}
-        {/* WORKER DASHBOARD VIEW (WITH DATE SELECTOR & TIMING INSPECTION) */}
+        {/* WORKER DASHBOARD VIEW */}
         {/* ========================================================= */}
         {userRole === 'worker' && (
           <main className="max-w-5xl mx-auto px-4 py-10 space-y-8 animate-in fade-in duration-300">
@@ -1588,7 +1606,7 @@ export default function Home() {
                     className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-bold"
                   >
                     {teamMembers.map(m => (
-                      <option key={m.id} value={m.user_id}>{m.full_name} (#{m.user_id})</option>
+                      <option key={m.id} value={String(m.user_id).trim()}>{m.full_name} (#{m.user_id})</option>
                     ))}
                   </select>
                 </div>
