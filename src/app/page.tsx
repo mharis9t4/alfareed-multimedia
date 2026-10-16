@@ -624,7 +624,7 @@ export default function Home() {
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex justify-between items-center">
             <div className="flex items-center gap-4">
               <div className="w-10 h-10 bg-[#FF6600] rounded-xl flex items-center justify-center text-white font-black text-xl shadow-md shadow-orange-500/20">
-                AF
+                ALFAREED
               </div>
               <div>
                 <div className="flex items-center gap-2">
