@@ -420,12 +420,12 @@ export default function Home() {
   const calculatedEstimate = useMemo(() => {
     const rates: Record<string, number> = {
       bw_copy: 6,
-      color_print: 25,
-      pvc_card: 150,
-      composing: 120,
-      spiral_binding: 90,
-      hard_binding: 450,
-      panaflex: 38
+      color_print: 100,
+      pvc_card: 200,
+      composing: 500,
+      spiral_binding: 250,
+      hard_binding: 1000,
+      panaflex: 45
     };
     return (rates[calcService] || 10) * Math.max(1, calcQuantity);
   }, [calcService, calcQuantity]);
@@ -2105,8 +2105,8 @@ export default function Home() {
                       onChange={(e: any) => setCalcService(e.target.value)}
                       className="w-full p-4 bg-white/10 border border-white/20 rounded-2xl text-white font-bold text-sm outline-none focus:border-[#FF6600]"
                     >
-                      <option className="bg-black text-white" value="color_print">Laser Color Print (A4 Glossy / 100gsm)</option>
-                      <option className="bg-black text-white" value="bw_copy">High-Speed B/W Photostat (A4 / 75gsm)</option>
+                      <option className="bg-black text-white" value="color_print">Laser Color Print (A4 Glossy / 200gsm)</option>
+                      <option className="bg-black text-white" value="bw_copy">High-Speed B/W Photostat (A4 / 70gsm)</option>
                       <option className="bg-black text-white" value="pvc_card">Smart PVC NFC Card (Printed Dual-Side)</option>
                       <option className="bg-black text-white" value="composing">Urdu / Legal Composing (Per Page)</option>
                       <option className="bg-black text-white" value="spiral_binding">Spiral / Thermal Binding (Per Book)</option>
