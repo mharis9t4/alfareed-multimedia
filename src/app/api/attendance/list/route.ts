@@ -1,3 +1,4 @@
+// app/api/attendance/list/route.ts
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 
@@ -24,11 +25,10 @@ export async function GET() {
         CAST(a.worker_id AS CHAR) = CAST(u.user_id AS CHAR) 
         OR CAST(a.worker_id AS CHAR) = CAST(u.id AS CHAR)
       )
-      ORDER BY a.id DESC
-      LIMIT 250
+      ORDER BY a.date DESC, a.id DESC
+      LIMIT 1000
     `);
 
-    // Standardize each record so the frontend date filter matches accurately
     const normalizedRows = (rows || []).map((row: any) => {
       let dateStr = '';
       if (row.date) {
@@ -47,14 +47,14 @@ export async function GET() {
         id: row.id,
         worker_id: String(row.worker_id || '').trim(),
         worker_name: row.worker_name || `Worker #${row.worker_id}`,
-        designations: row.designations || 'Team Member',
+        designations: row.designations || 'Production Staff',
         date: dateStr,
-        clock_in: String(row.clock_in || '—'),
+        clock_in: String(row.clock_in || '09:00:00'),
         clock_out: row.clock_out ? String(row.clock_out) : null,
         status: row.status || (row.clock_out ? 'Completed' : 'Active'),
         regular_hours: parseFloat(String(row.regular_hours || 0)),
         overtime_hours: parseFloat(String(row.overtime_hours || 0)),
-        created_at: row.created_at || null
+        created_at: row.created_at || null,
       };
     });
 

@@ -1,3 +1,4 @@
+// app/api/users/list/route.ts
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 
@@ -9,7 +10,7 @@ export async function GET() {
        WHERE role != 'customer' 
        ORDER BY id ASC`
     );
-    return NextResponse.json(rows);
+    return NextResponse.json(rows || []);
   } catch (error) {
     console.error('Fetch team list error:', error);
     return NextResponse.json(

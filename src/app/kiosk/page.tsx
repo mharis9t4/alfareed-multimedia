@@ -1,17 +1,24 @@
+// app/kiosk/page.tsx
 'use client';
+
 import { useState, useEffect, useRef } from 'react';
 
 type TerminalState = 'idle' | 'scanning' | 'clock_in' | 'clock_out' | 'error';
 
 interface ScanResult {
   action?: 'CLOCK_IN' | 'CLOCK_OUT';
+  isOvernight?: boolean;
+  shiftDate?: string;
   employee?: {
     name: string;
     worker_id: string;
+    designation?: string;
   };
   time?: string;
   date?: string;
   totalHours?: number;
+  regularHours?: number;
+  overtimeHours?: number;
   message?: string;
   error?: string;
   cardId?: string;
@@ -22,23 +29,23 @@ export default function KioskPage() {
   const [currentDate, setCurrentDate] = useState<string>('');
   const [state, setState] = useState<TerminalState>('idle');
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
-  
+
   // Mobile NFC States
   const [isMobileDevice, setIsMobileDevice] = useState<boolean>(false);
   const [nfcSupported, setNfcSupported] = useState<boolean>(false);
   const [nfcActive, setNfcActive] = useState<boolean>(false);
   const [nfcError, setNfcError] = useState<string>('');
 
-  const [recentLogs, setRecentLogs] = useState<Array<{ name: string; action: string; time: string }>>([]);
+  const [recentLogs, setRecentLogs] = useState<
+    Array<{ name: string; action: string; time: string; isOvernight?: boolean }>
+  >([]);
 
-  // Card debounce lock
+  // Card debounce lock (prevents accidental double tap within 4 seconds)
   const lastScannedCard = useRef<string>('');
   const lastScannedTime = useRef<number>(0);
   const resetTimer = useRef<NodeJS.Timeout | null>(null);
 
-  // -------------------------------------------------------------
   // 1. LIVE CLOCK (Karachi Time)
-  // -------------------------------------------------------------
   useEffect(() => {
     const updateTime = () => {
       const now = new Date();
@@ -48,7 +55,7 @@ export default function KioskPage() {
           hour: '2-digit',
           minute: '2-digit',
           second: '2-digit',
-          hour12: true
+          hour12: true,
         }).format(now)
       );
       setCurrentDate(
@@ -57,7 +64,7 @@ export default function KioskPage() {
           weekday: 'long',
           month: 'short',
           day: 'numeric',
-          year: 'numeric'
+          year: 'numeric',
         }).format(now)
       );
     };
@@ -66,12 +73,10 @@ export default function KioskPage() {
     return () => clearInterval(interval);
   }, []);
 
-  // -------------------------------------------------------------
   // 2. DEVICE CAPABILITY & SCREEN WAKE LOCK
-  // -------------------------------------------------------------
   useEffect(() => {
-    // Detect mobile touch environment
-    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
+    const isMobile =
+      /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
     setIsMobileDevice(isMobile);
 
     if (typeof window !== 'undefined' && 'NDEFReader' in window) {
@@ -84,24 +89,21 @@ export default function KioskPage() {
         if ('wakeLock' in navigator) {
           wakeLock = await (navigator as any).wakeLock.request('screen');
         }
-      } catch (err) {}
+      } catch {}
     };
-
     requestWakeLock();
+
     const handleVisibility = () => {
       if (document.visibilityState === 'visible') requestWakeLock();
     };
     document.addEventListener('visibilitychange', handleVisibility);
-
     return () => {
       document.removeEventListener('visibilitychange', handleVisibility);
       if (wakeLock) wakeLock.release().catch(() => {});
     };
   }, []);
 
-  // -------------------------------------------------------------
   // 3. SYNTHETIC AUDIO FEEDBACK (Web Audio API)
-  // -------------------------------------------------------------
   const playTone = (type: 'clock_in' | 'clock_out' | 'error') => {
     try {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
@@ -132,13 +134,13 @@ export default function KioskPage() {
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
         osc.frequency.setValueAtTime(659.25, ctx.currentTime);
-        osc.frequency.exponentialRampToValueAtTime(440.0, ctx.currentTime + 0.3);
+        osc.frequency.exponentialRampToValueAtTime(440.0, ctx.currentTime + 0.35);
         osc.connect(gain);
         gain.connect(ctx.destination);
         gain.gain.setValueAtTime(0.3, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.35);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4);
         osc.start(ctx.currentTime);
-        osc.stop(ctx.currentTime + 0.35);
+        osc.stop(ctx.currentTime + 0.4);
       } else {
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
@@ -151,12 +153,10 @@ export default function KioskPage() {
         osc.start(ctx.currentTime);
         osc.stop(ctx.currentTime + 0.3);
       }
-    } catch (e) {}
+    } catch {}
   };
 
-  // -------------------------------------------------------------
   // 4. SCAN PROCESSING & BACKEND SUBMISSION
-  // -------------------------------------------------------------
   const processCardScan = async (rawCardId: string) => {
     const cleanId = rawCardId.replace(/\D/g, '').trim();
     if (cleanId.length < 4) return;
@@ -169,7 +169,6 @@ export default function KioskPage() {
     lastScannedTime.current = now;
 
     if (resetTimer.current) clearTimeout(resetTimer.current);
-
     setState('scanning');
     setScanResult(null);
 
@@ -177,7 +176,7 @@ export default function KioskPage() {
       const res = await fetch('/api/attendance/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cardId: cleanId })
+        body: JSON.stringify({ cardId: cleanId }),
       });
 
       const data = await res.json();
@@ -187,27 +186,32 @@ export default function KioskPage() {
         if (data.action === 'CLOCK_IN') {
           setState('clock_in');
           playTone('clock_in');
-          setRecentLogs(prev => [
+          setRecentLogs((prev) => [
             { name: data.employee.name, action: 'IN', time: data.time },
-            ...prev.slice(0, 4)
+            ...prev.slice(0, 4),
           ]);
         } else {
           setState('clock_out');
           playTone('clock_out');
-          setRecentLogs(prev => [
-            { name: data.employee.name, action: 'OUT', time: data.time },
-            ...prev.slice(0, 4)
+          setRecentLogs((prev) => [
+            {
+              name: data.employee.name,
+              action: 'OUT',
+              time: data.time,
+              isOvernight: data.isOvernight,
+            },
+            ...prev.slice(0, 4),
           ]);
         }
       } else {
         setState('error');
         setScanResult({
           error: data.message || data.error || 'Card unrecognized',
-          cardId: cleanId
+          cardId: cleanId,
         });
         playTone('error');
       }
-    } catch (err) {
+    } catch {
       setState('error');
       setScanResult({ error: 'Server connection failed', cardId: cleanId });
       playTone('error');
@@ -216,12 +220,10 @@ export default function KioskPage() {
     resetTimer.current = setTimeout(() => {
       setState('idle');
       setScanResult(null);
-    }, 4000);
+    }, 4500);
   };
 
-  // -------------------------------------------------------------
   // 5. USB IC READER (Desktop Keyboard Wedge Buffer)
-  // -------------------------------------------------------------
   useEffect(() => {
     let buffer = '';
     let flushTimer: NodeJS.Timeout;
@@ -251,9 +253,7 @@ export default function KioskPage() {
     };
   }, []);
 
-  // -------------------------------------------------------------
   // 6. ANDROID WEB NFC: EXPLICIT USER GESTURE ACTIVATION
-  // -------------------------------------------------------------
   const activateMobileNFC = async () => {
     if (!('NDEFReader' in window)) {
       setNfcError('Web NFC is not supported in this browser. Use Chrome on Android.');
@@ -263,39 +263,26 @@ export default function KioskPage() {
     try {
       setNfcError('');
       const ndef = new (window as any).NDEFReader();
-      
-      // Explicit user gesture unlocks Chrome Reader Mode & claims tag focus
       await ndef.scan();
       setNfcActive(true);
 
       ndef.onreadingerror = () => {
-        setNfcError('NFC reading error. Ensure the card is held steady against the back of the phone.');
+        setNfcError('NFC reading error. Hold the card steady against the back of the phone.');
       };
 
       ndef.onreading = (event: any) => {
         if (!event.serialNumber) return;
-
-        // Split hex UID bytes (works for both 4-byte and 7-byte cards)
         const hexParts = event.serialNumber.split(':');
-        
-        // Take the first 4 bytes to match standard USB keyboard wedge output
         const first4 = hexParts.slice(0, 4);
-        
-        // Reverse bytes to Little-Endian 32-bit integer
         const littleEndianHex = [...first4].reverse().join('');
-        
-        // Parse to decimal and pad to 10 digits
         const decValue = parseInt(littleEndianHex, 16);
         const unifiedCardId = String(decValue).padStart(10, '0');
-
         processCardScan(unifiedCardId);
       };
-      
     } catch (err: any) {
-      console.error('NFC Scan Activation Error:', err);
       setNfcActive(false);
       if (err.name === 'NotAllowedError') {
-        setNfcError('NFC permission was denied. Tap the screen and select "Allow".');
+        setNfcError('NFC permission denied. Tap the screen and select "Allow".');
       } else {
         setNfcError(err.message || 'Could not start NFC scanner.');
       }
@@ -303,22 +290,26 @@ export default function KioskPage() {
   };
 
   return (
-    <main 
+    <main
       onClick={() => {
-        // Fallback user gesture: tapping anywhere on mobile starts the reader
         if (nfcSupported && !nfcActive) activateMobileNFC();
       }}
       className="min-h-screen bg-[#070707] text-white flex flex-col justify-between p-6 md:p-12 select-none font-sans relative overflow-hidden"
     >
       {/* Background Ambience Glow */}
-      <div className={`fixed inset-0 pointer-events-none transition-all duration-700 ${
-        state === 'clock_in' ? 'bg-emerald-600/15' :
-        state === 'clock_out' ? 'bg-blue-600/15' :
-        state === 'error' ? 'bg-red-600/15' :
-        'bg-[#FF6600]/5'
-      }`} />
+      <div
+        className={`fixed inset-0 pointer-events-none transition-all duration-700 ${
+          state === 'clock_in'
+            ? 'bg-emerald-600/15'
+            : state === 'clock_out'
+            ? 'bg-blue-600/15'
+            : state === 'error'
+            ? 'bg-red-600/15'
+            : 'bg-[#FF6600]/5'
+        }`}
+      />
 
-      {/* TOP BAR: Brand & Station Status */}
+      {/* TOP BAR */}
       <header className="relative z-10 flex justify-between items-start">
         <div>
           <div className="flex items-center gap-2">
@@ -327,8 +318,8 @@ export default function KioskPage() {
             </h1>
             <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
           </div>
-          <p className="text-[10px] md:text-xs font-mono uppercase tracking-[0.3em] text-slate-500 mt-1">
-            24/7 Attendance Gate • Johar Mor Station
+          <p className="text-[10px] md:text-xs font-mono uppercase tracking-[0.25em] text-slate-400 mt-1">
+            Johar Mor Station • Cross-Midnight Shift Engine (9 AM – Late Night)
           </p>
         </div>
 
@@ -340,23 +331,27 @@ export default function KioskPage() {
               USB IC Wedge: Active
             </div>
           )}
-
           {isMobileDevice && (
-            <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-[9px] font-mono uppercase transition-colors ${
-              nfcActive 
-                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' 
-                : 'bg-orange-500/10 border-orange-500/30 text-[#FF6600]'
-            }`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${nfcActive ? 'bg-emerald-500 animate-ping' : 'bg-[#FF6600]'}`} />
+            <div
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-[9px] font-mono uppercase transition-colors ${
+                nfcActive
+                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                  : 'bg-orange-500/10 border-orange-500/30 text-[#FF6600]'
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  nfcActive ? 'bg-emerald-500 animate-ping' : 'bg-[#FF6600]'
+                }`}
+              />
               {nfcActive ? 'Mobile NFC: Active' : 'NFC: Tap To Enable'}
             </div>
           )}
         </div>
       </header>
 
-      {/* CENTER: Status Stage */}
+      {/* CENTER STAGE */}
       <section className="relative z-10 flex flex-col items-center justify-center text-center my-auto py-6">
-        {/* MOBILE ACTIVATION BANNER: Overrides default Android system tag interception */}
         {isMobileDevice && !nfcActive && (
           <div className="mb-6 w-full max-w-sm animate-bounce">
             <button
@@ -366,12 +361,8 @@ export default function KioskPage() {
               }}
               className="w-full bg-[#FF6600] hover:bg-white hover:text-black text-white font-black py-4 px-6 rounded-2xl text-xs uppercase tracking-widest shadow-xl shadow-orange-600/30 transition-all flex items-center justify-center gap-2"
             >
-              <span>📱</span>
-              <span>Tap Screen to Activate Mobile NFC</span>
+              <span>📲 Tap Screen to Activate Mobile NFC</span>
             </button>
-            <p className="text-[10px] text-slate-400 mt-2 font-mono">
-              Enables Chrome Reader Mode to suppress Android system popups
-            </p>
           </div>
         )}
 
@@ -402,9 +393,11 @@ export default function KioskPage() {
                 Ready for Card Tap
               </h2>
               <p className="text-xs text-slate-400 font-medium mt-1">
-                {isMobileDevice 
-                  ? (nfcActive ? 'Hold card against the back of this phone' : 'Tap screen to engage NFC reader') 
-                  : 'Tap card on USB Reader to record attendance'}
+                {isMobileDevice
+                  ? nfcActive
+                    ? 'Hold employee card against the back of this phone'
+                    : 'Tap screen to engage NFC reader'
+                  : 'Tap employee card on USB Reader to Clock In or Clock Out'}
               </p>
             </div>
           </div>
@@ -432,34 +425,48 @@ export default function KioskPage() {
                 {scanResult.employee?.name}
               </h2>
               <p className="text-xs text-slate-400 font-mono mt-1">
-                ID: #{scanResult.employee?.worker_id} • Time: {scanResult.time}
+                ID: #{scanResult.employee?.worker_id} • {scanResult.employee?.designation || 'Staff'} • Time: {scanResult.time}
               </p>
             </div>
-            <p className="text-sm font-semibold text-emerald-300">
-              {scanResult.message}
-            </p>
+            <p className="text-sm font-semibold text-emerald-300">{scanResult.message}</p>
           </div>
         )}
 
         {state === 'clock_out' && scanResult && (
           <div className="space-y-4 max-w-lg bg-blue-950/40 border-2 border-blue-500/50 p-8 md:p-12 rounded-[40px] shadow-2xl animate-in zoom-in-95 duration-200">
             <div className="w-16 h-16 bg-blue-500 text-white rounded-2xl flex items-center justify-center mx-auto text-3xl font-bold">
-              👋
+              ★
             </div>
             <div>
-              <span className="inline-block px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest bg-blue-500/20 text-blue-400 border border-blue-500/30">
-                Shift Ended • Clocked Out
-              </span>
+              <div className="flex items-center justify-center gap-2 flex-wrap">
+                <span className="inline-block px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest bg-blue-500/20 text-blue-400 border border-blue-500/30">
+                  Shift Ended • Clocked Out
+                </span>
+                {scanResult.isOvernight && (
+                  <span className="inline-block px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                    🌙 Overnight Shift ({scanResult.shiftDate})
+                  </span>
+                )}
+              </div>
               <h2 className="text-3xl md:text-4xl font-black text-white mt-2">
                 {scanResult.employee?.name}
               </h2>
-              <p className="text-xs text-slate-400 font-mono mt-1">
-                Total Worked: <strong className="text-white">{scanResult.totalHours} hrs</strong> • Left at {scanResult.time}
-              </p>
+              <div className="grid grid-cols-3 gap-2 bg-white/5 border border-white/10 rounded-2xl p-3 mt-3 font-mono text-xs">
+                <div>
+                  <span className="text-[9px] text-slate-400 uppercase block">Total Worked</span>
+                  <strong className="text-white text-sm">{scanResult.totalHours}h</strong>
+                </div>
+                <div>
+                  <span className="text-[9px] text-slate-400 uppercase block">Regular</span>
+                  <strong className="text-emerald-400 text-sm">{scanResult.regularHours}h</strong>
+                </div>
+                <div>
+                  <span className="text-[9px] text-slate-400 uppercase block">Overtime</span>
+                  <strong className="text-[#FF6600] text-sm">+{scanResult.overtimeHours}h</strong>
+                </div>
+              </div>
             </div>
-            <p className="text-sm font-semibold text-blue-300">
-              {scanResult.message}
-            </p>
+            <p className="text-sm font-semibold text-blue-300">{scanResult.message}</p>
           </div>
         )}
 
@@ -482,15 +489,15 @@ export default function KioskPage() {
               )}
             </div>
             <p className="text-xs text-slate-400">
-              Please register this card via Admin Portal first.
+              Please pair this card to an employee via the Admin Portal first.
             </p>
           </div>
         )}
       </section>
 
-      {/* BOTTOM BAR: Recent Activity Log */}
+      {/* BOTTOM BAR */}
       <footer className="relative z-10 flex flex-col md:flex-row justify-between items-center gap-4 border-t border-white/5 pt-4">
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           <span className="text-[10px] font-mono uppercase tracking-widest text-slate-500">
             Recent Punches:
           </span>
@@ -505,19 +512,20 @@ export default function KioskPage() {
                       : 'bg-blue-500/10 text-blue-400 border-blue-500/20'
                   }`}
                 >
-                  {log.name.split(' ')[0]} ({log.action} @ {log.time})
+                  {log.name.split(' ')[0]} ({log.action} @ {log.time}
+                  {log.isOvernight ? ' 🌙' : ''})
                 </span>
               ))}
             </div>
           ) : (
             <span className="text-[10px] font-mono text-slate-600 italic">
-              No recent scans today
+              No recent scans in this session
             </span>
           )}
         </div>
 
         <p className="text-[9px] font-mono uppercase tracking-widest text-slate-600">
-          Al Fareed Multimedia • Hardware Engine v2.0
+          Al Fareed Multimedia • Hardware Engine v3.0 (Cross-Midnight Ready)
         </p>
       </footer>
     </main>
