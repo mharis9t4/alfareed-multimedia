@@ -5,20 +5,31 @@ on:
     branches:
       - main
 
+# Automatically cancels older in-progress runs when you push a new commit
+concurrency:
+  group: alfareed-production-deploy
+  cancel-in-progress: true
+
 jobs:
   build-and-deploy:
     name: 🏗️ Build & 🚚 Deploy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
       - name: 🚚 Get latest code
         uses: actions/checkout@v4
 
-      - name: 🛠️ Setup Node.js
+      - name: 🛠️ Setup Node.js with Cache
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
       - name: 📦 Install & Build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+          ESLINT_NO_DEV_ERRORS: true
         run: |
           npm install
           npm run build
@@ -37,12 +48,12 @@ jobs:
           server-dir: domains/alfareed.pk/public_html/
           protocol: ftp
           port: 21
-          timeout: 90000
-          # Cleans old files to ensure the new .next build is fresh
-          dangerous-clean-slate: false 
+          timeout: 180000
+          dangerous-clean-slate: false
           exclude: |
             **/.git*
             **/.github*
             **/node_modules/**
+            **/.next/cache/**
             **/*.zip
             **/*.rar
