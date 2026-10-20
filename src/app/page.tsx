@@ -1,4 +1,4 @@
-// app/page.tsx
+// src/app/page.tsx
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
@@ -9,7 +9,7 @@ import AdminPortal, {
   ProjectBrief,
 } from '@/components/AdminPortal';
 import WorkerPortal from '@/components/WorkerPortal';
-import { WageConfig, DEFAULT_WAGE_CONFIG } from '@/lib/payroll';
+import { WageConfig, OtPaymentRecord, DEFAULT_WAGE_CONFIG } from '@/lib/payroll';
 
 type UserRole = 'admin' | 'worker' | 'customer' | null;
 
@@ -27,9 +27,9 @@ export default function Home() {
   const [attendanceLogs, setAttendanceLogs] = useState<AttendanceRecord[]>([]);
   const [projectBriefs, setProjectBriefs] = useState<ProjectBrief[]>([]);
   const [wageProfiles, setWageProfiles] = useState<Record<string, WageConfig>>({});
+  const [otPayments, setOtPayments] = useState<Record<string, OtPaymentRecord>>({});
   const [isRefreshing, setIsRefreshing] = useState(false);
 
-  // Restore session on mount
   useEffect(() => {
     const saved = localStorage.getItem('alfareed_session');
     if (saved) {
@@ -43,15 +43,15 @@ export default function Home() {
     }
   }, []);
 
-  // Synchronize all data from MySQL APIs
   const fetchAllData = useCallback(async () => {
     setIsRefreshing(true);
     try {
-      const [teamRes, attRes, projRes, wageRes] = await Promise.all([
+      const [teamRes, attRes, projRes, wageRes, otRes] = await Promise.all([
         fetch('/api/users/list'),
         fetch('/api/attendance/list'),
         fetch('/api/projects/list').catch(() => null),
         fetch('/api/users/wage-config').catch(() => null),
+        fetch('/api/admin/ot-payments').catch(() => null),
       ]);
 
       if (teamRes.ok) {
@@ -98,6 +98,26 @@ export default function Home() {
           setWageProfiles(map);
         }
       }
+
+      if (otRes && otRes.ok) {
+        const otRows = await otRes.json();
+        if (Array.isArray(otRows)) {
+          const map: Record<string, OtPaymentRecord> = {};
+          otRows.forEach((r: any) => {
+            const wid = String(r.worker_id || '').trim();
+            if (wid) {
+              map[wid] = {
+                worker_id: wid,
+                period_key: r.period_key || 'CURRENT',
+                paid_ot_hours: Number(r.paid_ot_hours || 0),
+                paid_ot_amount: Number(r.paid_ot_amount || 0),
+                notes: r.notes || '',
+              };
+            }
+          });
+          setOtPayments(map);
+        }
+      }
     } catch (err) {
       console.error('Data sync failed:', err);
     } finally {
@@ -133,7 +153,6 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-[#111827] antialiased selection:bg-[#FF6600] selection:text-white">
-      {/* Shared Authenticated Top Bar */}
       <header className="sticky top-0 z-50 bg-white border-b border-slate-200 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex justify-between items-center">
           <div className="flex items-center gap-4">
@@ -180,6 +199,7 @@ export default function Home() {
           attendanceLogs={attendanceLogs}
           projectBriefs={projectBriefs}
           wageProfiles={wageProfiles}
+          otPayments={otPayments}
           isRefreshing={isRefreshing}
           onRefresh={fetchAllData}
         />
@@ -188,6 +208,7 @@ export default function Home() {
           userData={userData}
           attendanceLogs={attendanceLogs}
           wageConfig={wageProfiles[String(userData.user_id || '').trim()]}
+          otPayment={otPayments[String(userData.user_id || '').trim()]}
         />
       )}
     </div>

@@ -1,15 +1,18 @@
-// components/AdminPortal.tsx
+// src/components/AdminPortal.tsx
 'use client';
 
 import { useState, useEffect, useMemo } from 'react';
 import {
   PayBasis,
   PeriodFilter,
+  SundayMode,
   WageConfig,
+  OtPaymentRecord,
   DEFAULT_WAGE_CONFIG,
   convertWageRates,
-  evaluateShiftLog,
+  evaluateWorkerPeriodLogs,
   getDateRangeForPeriod,
+  getRegularSundayQuota,
 } from '@/lib/payroll';
 
 export interface TeamMember {
@@ -32,6 +35,8 @@ export interface AttendanceRecord {
   status: string;
   regular_hours?: string | number;
   overtime_hours?: string | number;
+  sunday_mode?: SundayMode | null;
+  sunday_coverage_hours?: number | string | null;
 }
 
 export interface ProjectBrief {
@@ -58,6 +63,7 @@ interface AdminPortalProps {
   attendanceLogs: AttendanceRecord[];
   projectBriefs: ProjectBrief[];
   wageProfiles: Record<string, WageConfig>;
+  otPayments: Record<string, OtPaymentRecord>;
   isRefreshing: boolean;
   onRefresh: () => void;
 }
@@ -67,6 +73,7 @@ export default function AdminPortal({
   attendanceLogs,
   projectBriefs,
   wageProfiles,
+  otPayments,
   isRefreshing,
   onRefresh,
 }: AdminPortalProps) {
@@ -78,7 +85,7 @@ export default function AdminPortal({
   const [adminTab, setAdminTab] = useState<AdminTab>('attendance');
   const [attendanceSearch, setAttendanceSearch] = useState('');
 
-  // Period & Worker Filter State (shared by Inspector & Payroll tabs)
+  // Period & Worker Filter State
   const [period, setPeriod] = useState<PeriodFilter>('month');
   const [anchorDate, setAnchorDate] = useState<string>(todayStr);
   const [customStart, setCustomStart] = useState<string>(todayStr.slice(0, 8) + '01');
@@ -111,6 +118,23 @@ export default function AdminPortal({
     ...DEFAULT_WAGE_CONFIG,
   });
 
+  // Paid Overtime Modal State
+  const [editingOtWorker, setEditingOtWorker] = useState<{
+    member: TeamMember;
+    totalOtHours: number;
+    totalOtEarned: number;
+    otHourlyRate: number;
+  } | null>(null);
+  const [otPaymentForm, setOtPaymentForm] = useState<{
+    paid_ot_hours: number;
+    paid_ot_amount: number;
+    notes: string;
+  }>({
+    paid_ot_hours: 0,
+    paid_ot_amount: 0,
+    notes: '',
+  });
+
   // NFC Card Pairing Modal State
   const [selectedCardWorker, setSelectedCardWorker] = useState<TeamMember | null>(null);
   const [isNfcModalOpen, setIsNfcModalOpen] = useState(false);
@@ -130,16 +154,71 @@ export default function AdminPortal({
     );
   };
 
-  // Live preview of converted rates inside the Wage Edit Modal
   const modalConvertedPreview = useMemo(() => convertWageRates(wageForm), [wageForm]);
 
-  // Active Date Window for Inspector & Payroll
   const dateWindow = useMemo(
     () => getDateRangeForPeriod(period, anchorDate, customStart, customEnd),
     [period, anchorDate, customStart, customEnd]
   );
 
-  // Filtered logs for Inspector
+  // Evaluate each worker across the selected period using the full Sunday Quota & Coverage/OT engine
+  const payrollMatrix = useMemo(() => {
+    return teamMembers.map((member) => {
+      const wid = String(member.user_id).trim();
+      const profile = getProfile(wid);
+
+      const workerLogs = attendanceLogs.filter((l) => {
+        const d = String(l.date || '').slice(0, 10);
+        return (
+          String(l.worker_id).trim() === wid &&
+          d >= dateWindow.startDate &&
+          d <= dateWindow.endDate
+        );
+      });
+
+      const report = evaluateWorkerPeriodLogs(workerLogs, profile);
+      const paidRecord = otPayments[wid] || {
+        worker_id: wid,
+        period_key: 'CURRENT',
+        paid_ot_hours: 0,
+        paid_ot_amount: 0,
+        notes: '',
+      };
+
+      const unpaidOtHours = Number(
+        Math.max(0, report.totalOvertimeHours - Number(paidRecord.paid_ot_hours || 0)).toFixed(2)
+      );
+      const unpaidOtAmount = Math.max(
+        0,
+        report.totalOvertimePay - Math.round(Number(paidRecord.paid_ot_amount || 0))
+      );
+
+      return {
+        member,
+        profile,
+        report,
+        paidRecord,
+        unpaidOtHours,
+        unpaidOtAmount,
+        balancePayableAfterOtPaid: Math.max(
+          0,
+          report.netPayout - Math.round(Number(paidRecord.paid_ot_amount || 0))
+        ),
+      };
+    });
+  }, [teamMembers, attendanceLogs, wageProfiles, otPayments, dateWindow]);
+
+  // Lookup map of evaluated shift logs by attendance record ID so all tables show exact Sunday Coverage/OT split
+  const evaluatedLogById = useMemo(() => {
+    const map = new Map<number, any>();
+    payrollMatrix.forEach((item) => {
+      item.report.evaluatedRows.forEach(({ log, ev }) => {
+        map.set(log.id, ev);
+      });
+    });
+    return map;
+  }, [payrollMatrix]);
+
   const periodLogs = useMemo(() => {
     return attendanceLogs.filter((log) => {
       const logDate = String(log.date || '').slice(0, 10);
@@ -151,77 +230,68 @@ export default function AdminPortal({
     });
   }, [attendanceLogs, dateWindow, selectedWorkerFilter]);
 
-  // Comprehensive Payroll & Time Matrix per Worker for the Selected Period
-  const payrollMatrix = useMemo(() => {
-    return teamMembers.map((member) => {
-      const wid = String(member.user_id).trim();
-      const profile = getProfile(wid);
-      const rates = convertWageRates(profile);
+  // Handler to change a Sunday shift's allocation mode (OVERTIME, COVERAGE, AUTO_SPLIT, CUSTOM_SPLIT, REGULAR)
+  const handleUpdateSundayMode = async (
+    record: AttendanceRecord,
+    mode: SundayMode,
+    askCustomHours?: boolean
+  ) => {
+    let covHours = Number(record.sunday_coverage_hours || 0);
+    if (mode === 'CUSTOM_SPLIT' || askCustomHours) {
+      const input = prompt(
+        `Enter how many hours from this Sunday shift (${record.date}) should be used to COVER SHORT HOURS.\nAny remaining worked hours on this Sunday will be paid as OVERTIME:`,
+        String(covHours || 3)
+      );
+      if (input === null) return;
+      covHours = Math.max(0, parseFloat(input) || 0);
+    }
 
-      const workerLogs = attendanceLogs.filter((l) => {
-        const d = String(l.date || '').slice(0, 10);
-        return (
-          String(l.worker_id).trim() === wid &&
-          d >= dateWindow.startDate &&
-          d <= dateWindow.endDate
-        );
+    try {
+      const res = await fetch('/api/attendance/sunday-mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          record_id: record.id,
+          sunday_mode: mode,
+          sunday_coverage_hours: covHours,
+        }),
       });
+      if (res.ok) {
+        onRefresh();
+      } else {
+        alert('Failed to update Sunday mode');
+      }
+    } catch {
+      alert('Network error');
+    }
+  };
 
-      let expectedHours = 0;
-      let givenHours = 0;
-      let regularHours = 0;
-      let otHours = 0;
-      let shortfallHours = 0;
-      let lateCount = 0;
-      let lateMins = 0;
-      let baseEarned = 0;
-      let otEarned = 0;
-      let lateDeduction = 0;
-      let shortfallDeduction = 0;
-      let netPay = 0;
-
-      workerLogs.forEach((l) => {
-        const ev = evaluateShiftLog(l.clock_in, l.clock_out, profile);
-        if (l.clock_out) {
-          expectedHours += ev.expectedHours;
-          givenHours += ev.totalGivenHours;
-          regularHours += ev.regularHours;
-          otHours += ev.overtimeHours;
-          shortfallHours += ev.shortfallHours;
-          baseEarned += ev.baseEarned;
-          otEarned += ev.otEarned;
-          lateDeduction += ev.lateDeduction;
-          shortfallDeduction += ev.shortfallDeduction;
-          netPay += ev.netPay;
-        }
-        if (ev.isLate) {
-          lateCount += 1;
-          lateMins += ev.lateMinutes;
-        }
+  // Save Paid Overtime record
+  const handleSaveOtPayment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingOtWorker) return;
+    try {
+      const res = await fetch('/api/admin/ot-payments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          worker_id: editingOtWorker.member.user_id,
+          period_key: 'CURRENT',
+          paid_ot_hours: otPaymentForm.paid_ot_hours,
+          paid_ot_amount: otPaymentForm.paid_ot_amount,
+          notes: otPaymentForm.notes,
+        }),
       });
-
-      return {
-        member,
-        profile,
-        rates,
-        shiftsCount: workerLogs.length,
-        completedShifts: workerLogs.filter((l) => !!l.clock_out).length,
-        expectedHours: Number(expectedHours.toFixed(1)),
-        givenHours: Number(givenHours.toFixed(1)),
-        regularHours: Number(regularHours.toFixed(1)),
-        otHours: Number(otHours.toFixed(1)),
-        shortfallHours: Number(shortfallHours.toFixed(1)),
-        netVariance: Number((givenHours - expectedHours).toFixed(1)),
-        lateCount,
-        lateMins,
-        baseEarned,
-        otEarned,
-        lateDeduction,
-        shortfallDeduction,
-        netPay,
-      };
-    });
-  }, [teamMembers, attendanceLogs, wageProfiles, dateWindow]);
+      if (res.ok) {
+        setEditingOtWorker(null);
+        onRefresh();
+      } else {
+        alert('Failed to save OT payment');
+      }
+    } catch {
+      alert('Network error');
+    }
+  };
 
   // NFC Enrollment Listener when Card Modal is open
   useEffect(() => {
@@ -285,7 +355,6 @@ export default function AdminPortal({
     };
   }, [isNfcModalOpen, selectedCardWorker, onRefresh]);
 
-  // Admin Manual Sign-Out Handler
   const handleAdminClockOut = async (record: AttendanceRecord) => {
     const defaultNow = new Intl.DateTimeFormat('en-GB', {
       timeZone: 'Asia/Karachi',
@@ -313,18 +382,10 @@ export default function AdminPortal({
           clock_out: outTimeInput.trim(),
         }),
       });
-      if (res.ok) {
-        onRefresh();
-      } else {
-        const err = await res.json();
-        alert(err.error || 'Failed to sign out worker.');
-      }
-    } catch {
-      alert('Network error.');
-    }
+      if (res.ok) onRefresh();
+    } catch {}
   };
 
-  // Admin Delete Shift Log Handler
   const handleDeleteShift = async (id: number) => {
     if (!confirm('Delete this attendance record permanently?')) return;
     try {
@@ -337,7 +398,6 @@ export default function AdminPortal({
     } catch {}
   };
 
-  // Save Manual Shift Add/Edit
   const handleSaveManualRecord = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
@@ -349,19 +409,13 @@ export default function AdminPortal({
           ...manualForm,
         }),
       });
-      const data = await res.json();
       if (res.ok) {
         setIsManualModalOpen(false);
         onRefresh();
-      } else {
-        alert(data.error || 'Failed to save record');
       }
-    } catch {
-      alert('Network error.');
-    }
+    } catch {}
   };
 
-  // Save Worker Shift & Wage Profile to MySQL
   const handleSaveWageConfig = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingWageWorker) return;
@@ -378,12 +432,7 @@ export default function AdminPortal({
       if (res.ok) {
         setEditingWageWorker(null);
         onRefresh();
-      } else {
-        const err = await res.json();
-        alert(err.error || 'Failed to save wage configuration');
       }
-    } catch {
-      alert('Network error while saving wage configuration');
     } finally {
       setIsSavingWage(false);
     }
@@ -428,7 +477,7 @@ export default function AdminPortal({
           <p className="text-3xl font-black font-mono text-black mt-2">
             Rs.{' '}
             {payrollMatrix
-              .reduce((acc, r) => acc + r.netPay, 0)
+              .reduce((acc, r) => acc + r.report.netPayout, 0)
               .toLocaleString()}
           </p>
           <p className="text-[11px] text-slate-400 font-semibold mt-1 truncate">
@@ -474,10 +523,10 @@ export default function AdminPortal({
       <div className="flex border-b border-slate-200 space-x-2 overflow-x-auto no-scrollbar">
         {(
           [
-            { id: 'attendance', label: '⚡ Live Punches & Sign-Out' },
-            { id: 'inspector', label: '📅 Time & Shift Inspector' },
-            { id: 'wages', label: '⚙️ Shift Timings & Salary Master' },
-            { id: 'payroll', label: '💰 Payroll, Shortfall & OT' },
+            { id: 'attendance', label: '⚡ Live Punches & Sunday Toggle' },
+            { id: 'inspector', label: '📅 Shift & Sunday Inspector' },
+            { id: 'wages', label: '⚙️ Shift Timings & 26/28/30d Master' },
+            { id: 'payroll', label: '💰 Payroll, Coverage & Paid OT' },
             { id: 'cards', label: '🪪 NFC Card Pairing' },
             { id: 'leads', label: `📬 Client Inquiries (${projectBriefs.length})` },
             { id: 'register', label: '➕ Register Staff' },
@@ -497,7 +546,7 @@ export default function AdminPortal({
         ))}
       </div>
 
-      {/* SHARED PERIOD FILTER BAR FOR INSPECTOR & PAYROLL */}
+      {/* SHARED PERIOD FILTER BAR */}
       {(adminTab === 'inspector' || adminTab === 'payroll') && (
         <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm space-y-4">
           <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
@@ -593,16 +642,17 @@ export default function AdminPortal({
         </div>
       )}
 
-      {/* TAB 1: LIVE ATTENDANCE FEED */}
+      {/* TAB 1: LIVE ATTENDANCE FEED + SUNDAY ALLOCATION TOGGLE */}
       {adminTab === 'attendance' && (
         <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
           <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
             <div>
               <h2 className="text-2xl font-black tracking-tight text-black">
-                Live Gate Punches & Active Shifts
+                Live Gate Punches & Sunday Coverage/OT Controls
               </h2>
               <p className="text-xs text-slate-400 font-semibold mt-0.5">
-                Supports cross-midnight shifts (9:00 AM to 1:30 AM next day)
+                Any Sunday shift shows interactive buttons to toggle between Overtime, Shortfall
+                Coverage, or Split (Both)
               </p>
             </div>
             <input
@@ -615,15 +665,15 @@ export default function AdminPortal({
           </div>
 
           <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse min-w-[900px]">
+            <table className="w-full text-left border-collapse min-w-[980px]">
               <thead>
                 <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
                   <th className="pb-3 pl-2">Worker</th>
                   <th className="pb-3">Shift Date</th>
-                  <th className="pb-3">Tap In</th>
-                  <th className="pb-3">Tap Out</th>
+                  <th className="pb-3">Tap In / Out</th>
                   <th className="pb-3">Should Be</th>
-                  <th className="pb-3">Given / OT</th>
+                  <th className="pb-3">Given / Allocation</th>
+                  <th className="pb-3">Sunday Usage Toggle</th>
                   <th className="pb-3">Day Pay</th>
                   <th className="pb-3 text-right pr-2">Controls</th>
                 </tr>
@@ -639,7 +689,9 @@ export default function AdminPortal({
                   .slice(0, 100)
                   .map((log) => {
                     const profile = getProfile(log.worker_id);
-                    const ev = evaluateShiftLog(log.clock_in, log.clock_out, profile);
+                    const ev =
+                      evaluatedLogById.get(log.id) ||
+                      evaluateWorkerPeriodLogs([log], profile).evaluatedRows[0].ev;
 
                     return (
                       <tr key={log.id} className="hover:bg-slate-50/70 transition-colors">
@@ -648,35 +700,54 @@ export default function AdminPortal({
                             {log.worker_name || 'Staff'}
                           </span>
                           <span className="font-mono text-[10px] text-slate-400">
-                            ID: #{log.worker_id} • {log.designations}
+                            ID: #{log.worker_id} ({profile.working_days_month}d/mo)
                           </span>
                         </td>
                         <td className="py-4 font-mono text-slate-700">
                           {log.date}
+                          {ev.isSunday && (
+                            <span
+                              className={`ml-1.5 px-2 py-0.5 rounded text-[9px] font-sans font-black uppercase ${
+                                ev.treatAsOffSunday
+                                  ? 'bg-purple-50 text-purple-700 border border-purple-200'
+                                  : 'bg-blue-50 text-blue-700 border border-blue-200'
+                              }`}
+                            >
+                              {ev.treatAsOffSunday ? '☀️ Off-Sunday' : '📅 Reg-Sunday'}
+                            </span>
+                          )}
                           {ev.crossedMidnight && (
-                            <span className="ml-1.5 px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 text-[9px] font-sans">
-                              🌙 Overnight
+                            <span className="ml-1 px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 text-[9px] font-sans">
+                              🌙 +1d
                             </span>
                           )}
                         </td>
-                        <td className="py-4 font-mono font-bold text-emerald-600">
-                          {log.clock_in}
-                          {ev.isLate && (
-                            <span className="block text-[9px] text-red-500">
-                              Late {ev.lateMinutes}m
+                        <td className="py-4 font-mono">
+                          <span className="text-emerald-600 font-bold">{log.clock_in}</span>
+                          <span className="text-slate-400 mx-1">→</span>
+                          <span className="text-blue-600 font-bold">
+                            {log.clock_out || 'Active'}
+                          </span>
+                        </td>
+                        <td className="py-4 font-mono text-slate-500">
+                          {ev.expectedHours}h
+                          {ev.treatAsOffSunday && (
+                            <span className="block text-[9px] text-purple-600">
+                              (Not in 26d quota)
                             </span>
                           )}
                         </td>
-                        <td className="py-4 font-mono font-bold text-blue-600">
-                          {log.clock_out || <span className="text-[#FF6600]">On Floor</span>}
-                        </td>
-                        <td className="py-4 font-mono text-slate-500">{ev.expectedHours}h</td>
                         <td className="py-4 font-mono">
                           {log.clock_out ? (
                             <div>
                               <span className="font-bold text-black">{ev.totalGivenHours}h</span>
+                              {ev.coverageHours > 0 && (
+                                <span className="text-blue-600 font-bold ml-1">
+                                  ({ev.coverageHours}h Cover)
+                                </span>
+                              )}
                               {ev.overtimeHours > 0 && (
-                                <span className="text-emerald-600 ml-1">
+                                <span className="text-emerald-600 font-bold ml-1">
                                   (+{ev.overtimeHours}h OT)
                                 </span>
                               )}
@@ -690,15 +761,50 @@ export default function AdminPortal({
                             <span className="text-[#FF6600] font-bold">In Progress</span>
                           )}
                         </td>
+                        <td className="py-4">
+                          {ev.isSunday ? (
+                            <div className="flex flex-wrap gap-1">
+                              {(
+                                [
+                                  { id: 'AUTO_SPLIT', label: 'Auto Cover+OT' },
+                                  { id: 'OVERTIME', label: '100% OT' },
+                                  { id: 'COVERAGE', label: '100% Cover' },
+                                  { id: 'CUSTOM_SPLIT', label: 'Split Hrs' },
+                                  { id: 'REGULAR', label: 'Reg Day' },
+                                ] as { id: SundayMode; label: string }[]
+                              ).map((btn) => (
+                                <button
+                                  key={btn.id}
+                                  onClick={() =>
+                                    handleUpdateSundayMode(
+                                      log,
+                                      btn.id,
+                                      btn.id === 'CUSTOM_SPLIT'
+                                    )
+                                  }
+                                  className={`px-2 py-1 rounded-md text-[9px] font-black uppercase transition-all ${
+                                    (log.sunday_mode || 'AUTO_SPLIT') === btn.id
+                                      ? 'bg-[#FF6600] text-white'
+                                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                                  }`}
+                                >
+                                  {btn.label}
+                                </button>
+                              ))}
+                            </div>
+                          ) : (
+                            <span className="text-[10px] text-slate-400">Standard Shift</span>
+                          )}
+                        </td>
                         <td className="py-4 font-mono font-black text-black">
                           {log.clock_out ? `Rs. ${ev.netPay.toLocaleString()}` : '—'}
                         </td>
                         <td className="py-4 pr-2 text-right">
-                          <div className="flex items-center justify-end gap-2">
+                          <div className="flex items-center justify-end gap-1.5">
                             {!log.clock_out && (
                               <button
                                 onClick={() => handleAdminClockOut(log)}
-                                className="bg-red-50 hover:bg-red-600 text-red-600 hover:text-white border border-red-200 px-3 py-1 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all"
+                                className="bg-red-50 hover:bg-red-600 text-red-600 hover:text-white border border-red-200 px-2.5 py-1 rounded-lg text-[10px] font-black uppercase"
                               >
                                 Sign Out
                               </button>
@@ -715,14 +821,13 @@ export default function AdminPortal({
                                 });
                                 setIsManualModalOpen(true);
                               }}
-                              className="px-2.5 py-1 bg-slate-100 hover:bg-black hover:text-white rounded-lg text-[10px] font-bold uppercase transition-all"
+                              className="px-2 py-1 bg-slate-100 hover:bg-black hover:text-white rounded-lg text-[10px] font-bold uppercase"
                             >
                               Edit
                             </button>
                             <button
                               onClick={() => handleDeleteShift(log.id)}
-                              className="px-2 py-1 text-slate-400 hover:text-red-600 text-xs font-bold"
-                              title="Delete record"
+                              className="px-1.5 py-1 text-slate-400 hover:text-red-600 text-xs font-bold"
                             >
                               🗑
                             </button>
@@ -742,7 +847,9 @@ export default function AdminPortal({
         <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
           <div className="flex justify-between items-center">
             <div>
-              <h2 className="text-2xl font-black text-black">Detailed Shift Inspector</h2>
+              <h2 className="text-2xl font-black text-black">
+                Shift & Sunday Allocation Inspector
+              </h2>
               <p className="text-xs text-slate-400 font-semibold">
                 Showing {periodLogs.length} shift logs for {dateWindow.label}
               </p>
@@ -752,7 +859,9 @@ export default function AdminPortal({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {periodLogs.map((record) => {
               const profile = getProfile(record.worker_id);
-              const ev = evaluateShiftLog(record.clock_in, record.clock_out, profile);
+              const ev =
+                evaluatedLogById.get(record.id) ||
+                evaluateWorkerPeriodLogs([record], profile).evaluatedRows[0].ev;
 
               return (
                 <div
@@ -765,23 +874,13 @@ export default function AdminPortal({
                         {record.worker_name || `Worker #${record.worker_id}`}
                       </h4>
                       <p className="text-[10px] font-mono text-slate-400">
-                        Date: {record.date} • Scheduled: {profile.shift_start}–{profile.shift_end} (
-                        {ev.expectedHours}h)
+                        Date: {record.date} • Schedule: {profile.working_days_month}d/mo
                       </p>
                     </div>
                     <div className="flex items-center gap-2">
-                      {ev.crossedMidnight && (
-                        <span className="px-2.5 py-1 rounded-full text-[9px] font-black uppercase bg-amber-50 text-amber-700 border border-amber-200">
-                          🌙 Cross-Midnight
-                        </span>
-                      )}
-                      {ev.isLate ? (
-                        <span className="px-2.5 py-1 rounded-full text-[10px] font-black uppercase bg-red-50 text-red-600 border border-red-200">
-                          Late {ev.lateMinutes}m
-                        </span>
-                      ) : (
-                        <span className="px-2.5 py-1 rounded-full text-[10px] font-black uppercase bg-emerald-50 text-emerald-700 border border-emerald-200">
-                          On Schedule
+                      {ev.isSunday && (
+                        <span className="px-2.5 py-1 rounded-full text-[9px] font-black uppercase bg-purple-50 text-purple-700 border border-purple-200">
+                          {ev.treatAsOffSunday ? '☀️ Off-Day Sunday' : '📅 Regular Sunday'}
                         </span>
                       )}
                       <button
@@ -806,15 +905,11 @@ export default function AdminPortal({
                   <div className="grid grid-cols-4 gap-2 text-xs bg-slate-50 p-4 rounded-2xl border border-slate-100 font-mono">
                     <div>
                       <span className="text-[9px] font-sans font-black uppercase text-slate-400 block">
-                        Tap In
+                        Tap In / Out
                       </span>
-                      <strong className="text-emerald-600">{record.clock_in}</strong>
-                    </div>
-                    <div>
-                      <span className="text-[9px] font-sans font-black uppercase text-slate-400 block">
-                        Tap Out
-                      </span>
-                      <strong className="text-blue-600">{record.clock_out || 'Active'}</strong>
+                      <strong className="text-black">
+                        {record.clock_in.slice(0, 5)}–{record.clock_out?.slice(0, 5) || 'Active'}
+                      </strong>
                     </div>
                     <div>
                       <span className="text-[9px] font-sans font-black uppercase text-slate-400 block">
@@ -826,37 +921,57 @@ export default function AdminPortal({
                     </div>
                     <div>
                       <span className="text-[9px] font-sans font-black uppercase text-slate-400 block">
-                        Variance
+                        Cover Used
+                      </span>
+                      <strong className="text-blue-600">{ev.coverageHours}h</strong>
+                    </div>
+                    <div>
+                      <span className="text-[9px] font-sans font-black uppercase text-slate-400 block">
+                        OT / Short
                       </span>
                       {ev.overtimeHours > 0 ? (
                         <strong className="text-emerald-600">+{ev.overtimeHours}h OT</strong>
                       ) : ev.shortfallHours > 0 ? (
                         <strong className="text-red-500">-{ev.shortfallHours}h Short</strong>
                       ) : (
-                        <strong className="text-slate-500">0.0h</strong>
+                        <strong className="text-slate-400">0.0h</strong>
                       )}
                     </div>
                   </div>
 
-                  <div className="flex justify-between items-center text-xs pt-2 border-t border-slate-100">
-                    <div className="space-x-3 font-mono text-[11px]">
-                      <span>Base: Rs.{ev.baseEarned}</span>
-                      {ev.otEarned > 0 && (
-                        <span className="text-emerald-600 font-bold">+OT: Rs.{ev.otEarned}</span>
-                      )}
-                      {ev.lateDeduction > 0 && (
-                        <span className="text-red-500 font-bold">-Late: Rs.{ev.lateDeduction}</span>
-                      )}
-                    </div>
-                    <div className="text-right">
-                      <span className="text-[9px] font-black uppercase text-slate-400 block">
-                        Net Shift Payout
+                  {/* Sunday Allocation Quick Toggle inside Inspector Card */}
+                  {ev.isSunday && (
+                    <div className="bg-purple-50/60 border border-purple-200/80 p-3 rounded-2xl flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-[10px] font-black uppercase text-purple-800">
+                        Sunday Mode:
                       </span>
-                      <span className="font-mono font-black text-base text-black">
-                        Rs. {ev.netPay.toLocaleString()}
-                      </span>
+                      <div className="flex flex-wrap gap-1">
+                        {(
+                          [
+                            { id: 'AUTO_SPLIT', label: 'Auto Cover+OT' },
+                            { id: 'OVERTIME', label: 'Full OT' },
+                            { id: 'COVERAGE', label: 'Full Coverage' },
+                            { id: 'CUSTOM_SPLIT', label: 'Custom Split (e.g. 3h)' },
+                            { id: 'REGULAR', label: 'Count as Regular' },
+                          ] as { id: SundayMode; label: string }[]
+                        ).map((m) => (
+                          <button
+                            key={m.id}
+                            onClick={() =>
+                              handleUpdateSundayMode(record, m.id, m.id === 'CUSTOM_SPLIT')
+                            }
+                            className={`px-2.5 py-1 rounded-lg text-[9px] font-black uppercase ${
+                              (record.sunday_mode || 'AUTO_SPLIT') === m.id
+                                ? 'bg-purple-700 text-white'
+                                : 'bg-white text-purple-700 border border-purple-200'
+                            }`}
+                          >
+                            {m.label}
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                  </div>
+                  )}
                 </div>
               );
             })}
@@ -864,30 +979,30 @@ export default function AdminPortal({
         </div>
       )}
 
-      {/* TAB 3: STAFF SHIFT TIMINGS & WAGE MASTER (WITH AUTO-CONVERSION) */}
+      {/* TAB 3: STAFF SHIFT TIMINGS & 26/28/30 WORKING DAYS MASTER */}
       {adminTab === 'wages' && (
         <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
           <div>
             <h2 className="text-2xl font-black tracking-tight text-black">
-              Staff Shift Timings & Multi-Basis Wage Master
+              Staff Shift Timings & 26 / 28 / 30 Working Days Master
             </h2>
             <p className="text-xs text-slate-400 font-semibold mt-0.5">
-              Set any worker on Monthly, Weekly, Daily, or Hourly base pay — system automatically
-              computes all equivalent rates from their scheduled shift hours
+              • 26 Days = 4 Sundays Off (Sundays excluded from expected hours, used for OT/Coverage)
+              • 28 Days = 2 Sundays Regular + 2 Sundays OT/Coverage • 30 Days = All Sundays Regular
             </p>
           </div>
 
           <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse min-w-[950px]">
+            <table className="w-full text-left border-collapse min-w-[980px]">
               <thead>
                 <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
                   <th className="pb-3 pl-2">Employee</th>
-                  <th className="pb-3">Scheduled Shift</th>
+                  <th className="pb-3">Shift & Sunday Rule</th>
                   <th className="pb-3">Selected Base</th>
                   <th className="pb-3">Monthly Eq.</th>
                   <th className="pb-3">Weekly Eq.</th>
                   <th className="pb-3">Daily Eq.</th>
-                  <th className="pb-3">Hourly / OT Rate</th>
+                  <th className="pb-3">Hourly / OT</th>
                   <th className="pb-3 text-right pr-2">Configure</th>
                 </tr>
               </thead>
@@ -895,6 +1010,7 @@ export default function AdminPortal({
                 {teamMembers.map((member) => {
                   const profile = getProfile(member.user_id);
                   const rates = convertWageRates(profile);
+                  const regSunQuota = getRegularSundayQuota(profile.working_days_month);
 
                   return (
                     <tr key={member.id} className="hover:bg-slate-50/70 transition-colors">
@@ -906,10 +1022,15 @@ export default function AdminPortal({
                       </td>
                       <td className="py-4 font-mono">
                         <span className="px-2.5 py-1 rounded-lg bg-slate-100 font-bold text-black">
-                          {profile.shift_start} – {profile.shift_end}
+                          {profile.shift_start} – {profile.shift_end} ({rates.shiftDurationHours}h)
                         </span>
-                        <span className="block text-[10px] text-slate-400 mt-0.5">
-                          {rates.shiftDurationHours} hrs/day • Grace: {profile.grace_period_mins}m
+                        <span className="block text-[10px] text-purple-700 font-sans font-bold mt-1">
+                          {profile.working_days_month}d/mo:{' '}
+                          {regSunQuota === 0
+                            ? 'All 4 Sundays Off (OT/Cover)'
+                            : regSunQuota >= 4
+                            ? 'All Sundays Regular'
+                            : `${regSunQuota} Sun Regular + ${4 - regSunQuota} Sun OT/Cover`}
                         </span>
                       </td>
                       <td className="py-4">
@@ -919,23 +1040,17 @@ export default function AdminPortal({
                       </td>
                       <td className="py-4 font-mono font-bold text-black">
                         Rs. {rates.monthlyRate.toLocaleString()}
-                        <span className="block text-[9px] text-slate-400">
-                          ({profile.working_days_month}d/mo)
-                        </span>
                       </td>
                       <td className="py-4 font-mono text-slate-700">
                         Rs. {rates.weeklyRate.toLocaleString()}
-                        <span className="block text-[9px] text-slate-400">
-                          ({profile.working_days_week}d/wk)
-                        </span>
                       </td>
                       <td className="py-4 font-mono text-slate-700">
-                        Rs. {rates.dailyRate.toLocaleString()}/day
+                        Rs. {rates.dailyRate.toLocaleString()}/d
                       </td>
                       <td className="py-4 font-mono">
-                        <span className="font-bold text-black">Rs. {rates.hourlyRate}/hr</span>
+                        <span className="font-bold text-black">Rs. {rates.hourlyRate}/h</span>
                         <span className="block text-[10px] text-[#FF6600] font-bold">
-                          OT ({profile.ot_multiplier}x): Rs. {rates.otHourlyRate}/hr
+                          OT: Rs. {rates.otHourlyRate}/h
                         </span>
                       </td>
                       <td className="py-4 pr-2 text-right">
@@ -946,7 +1061,7 @@ export default function AdminPortal({
                           }}
                           className="bg-black hover:bg-[#FF6600] text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all"
                         >
-                          Configure Shift & Pay
+                          Configure
                         </button>
                       </td>
                     </tr>
@@ -958,31 +1073,31 @@ export default function AdminPortal({
         </div>
       )}
 
-      {/* TAB 4: PRECISION PAYROLL, SHORTFALL & OVERTIME */}
+      {/* TAB 4: PAYROLL, SUNDAY COVERAGE & PAID OVERTIME LEDGER */}
       {adminTab === 'payroll' && (
         <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
           <div>
             <h2 className="text-2xl font-black tracking-tight text-black">
-              Payroll, Shortfall & Overtime Ledger
+              Payroll, Sunday Coverage & Paid Overtime Ledger
             </h2>
             <p className="text-xs text-slate-400 font-semibold mt-0.5">
-              Period: <strong className="text-[#FF6600]">{dateWindow.label}</strong>
+              Tracks Regular Expected Hours (excluding off-Sundays for 26d workers), Sunday
+              Coverage applied to Shortfall, Earned Overtime, and Paid Overtime status
             </p>
           </div>
 
           <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse min-w-[950px]">
+            <table className="w-full text-left border-collapse min-w-[1050px]">
               <thead>
                 <tr className="text-[10px] font-black uppercase tracking-wider text-slate-400 border-b border-slate-100">
                   <th className="pb-3 pl-2">Employee</th>
-                  <th className="pb-3">Shifts</th>
-                  <th className="pb-3">Should Be Present</th>
-                  <th className="pb-3">Actual Given</th>
-                  <th className="pb-3">Shortfall / OT</th>
-                  <th className="pb-3">Base Earned</th>
-                  <th className="pb-3">Late Penalty</th>
-                  <th className="pb-3">OT Bonus</th>
-                  <th className="pb-3 text-right pr-2">Net Payout</th>
+                  <th className="pb-3">Should Be (Reg)</th>
+                  <th className="pb-3">Given (Reg + Sun)</th>
+                  <th className="pb-3">Shortfall & Sun Cover</th>
+                  <th className="pb-3">Total OT Earned</th>
+                  <th className="pb-3">OT Paid Out</th>
+                  <th className="pb-3">Unpaid OT Balance</th>
+                  <th className="pb-3 text-right pr-2">Total Net Salary</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 text-xs font-semibold">
@@ -992,41 +1107,101 @@ export default function AdminPortal({
                       selectedWorkerFilter === 'ALL' ||
                       String(row.member.user_id).trim() === String(selectedWorkerFilter).trim()
                   )
-                  .map((row) => (
-                    <tr key={row.member.id} className="hover:bg-slate-50/70 transition-colors">
-                      <td className="py-4 pl-2">
-                        <span className="font-bold text-black block">{row.member.full_name}</span>
-                        <span className="font-mono text-[10px] text-slate-400">
-                          {row.profile.pay_type.toUpperCase()}: Rs.{' '}
-                          {Number(row.profile.base_rate).toLocaleString()} (Rs.{row.rates.hourlyRate}
-                          /h)
-                        </span>
-                      </td>
-                      <td className="py-4 font-mono text-slate-600">{row.completedShifts}</td>
-                      <td className="py-4 font-mono text-slate-600">{row.expectedHours}h</td>
-                      <td className="py-4 font-mono font-bold text-black">{row.givenHours}h</td>
-                      <td className="py-4 font-mono">
-                        <span className="text-emerald-600 font-bold">+{row.otHours}h OT</span>
-                        <span className="block text-[10px] text-red-500">
-                          -{row.shortfallHours}h Short
-                        </span>
-                      </td>
-                      <td className="py-4 font-mono text-slate-700">
-                        Rs. {row.baseEarned.toLocaleString()}
-                      </td>
-                      <td className="py-4 font-mono text-red-500 font-bold">
-                        {row.lateDeduction > 0
-                          ? `-Rs. ${row.lateDeduction.toLocaleString()} (${row.lateCount}x)`
-                          : 'Rs. 0'}
-                      </td>
-                      <td className="py-4 font-mono text-emerald-600 font-bold">
-                        {row.otEarned > 0 ? `+Rs. ${row.otEarned.toLocaleString()}` : 'Rs. 0'}
-                      </td>
-                      <td className="py-4 pr-2 text-right font-mono font-black text-base text-black">
-                        Rs. {row.netPay.toLocaleString()}
-                      </td>
-                    </tr>
-                  ))}
+                  .map((row) => {
+                    const r = row.report;
+                    return (
+                      <tr key={row.member.id} className="hover:bg-slate-50/70 transition-colors">
+                        <td className="py-4 pl-2">
+                          <span className="font-bold text-black block">{row.member.full_name}</span>
+                          <span className="font-mono text-[10px] text-slate-400">
+                            {row.profile.working_days_month}d/mo • Rs.{r.rates.hourlyRate}/h (OT Rs.
+                            {r.rates.otHourlyRate}/h)
+                          </span>
+                        </td>
+                        <td className="py-4 font-mono text-slate-700">
+                          <strong>{r.expectedPresentHours}h</strong>
+                          <span className="block text-[9px] text-slate-400">
+                            ({r.completedShifts - r.offDaySundaysWorked} reg shifts)
+                          </span>
+                        </td>
+                        <td className="py-4 font-mono">
+                          <strong className="text-black">{r.totalGivenHours}h total</strong>
+                          {r.sundayTotalWorkedHours > 0 && (
+                            <span className="block text-[10px] text-purple-700 font-bold">
+                              ☀️ Off-Sun Worked: {r.sundayTotalWorkedHours}h
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-4 font-mono">
+                          <span className="text-slate-500 block text-[10px]">
+                            Gross Short: -{r.grossShortfallHours}h
+                          </span>
+                          {r.sundayCoverageHoursUsed > 0 && (
+                            <span className="text-blue-600 font-bold block text-[10px]">
+                              ✓ Covered by Sun: +{r.sundayCoverageHoursUsed}h
+                            </span>
+                          )}
+                          <span
+                            className={`font-bold ${
+                              r.netShortfallHours > 0 ? 'text-red-500' : 'text-emerald-600'
+                            }`}
+                          >
+                            Net Short: -{r.netShortfallHours}h
+                          </span>
+                        </td>
+                        <td className="py-4 font-mono">
+                          <strong className="text-emerald-600">+{r.totalOvertimeHours}h OT</strong>
+                          <span className="block text-[10px] font-bold text-black">
+                            Rs. {r.totalOvertimePay.toLocaleString()}
+                          </span>
+                        </td>
+                        <td className="py-4 font-mono">
+                          <span className="px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200 font-bold block w-fit">
+                            Paid: {row.paidRecord.paid_ot_hours}h (Rs.{' '}
+                            {Number(row.paidRecord.paid_ot_amount).toLocaleString()})
+                          </span>
+                          <button
+                            onClick={() => {
+                              setEditingOtWorker({
+                                member: row.member,
+                                totalOtHours: r.totalOvertimeHours,
+                                totalOtEarned: r.totalOvertimePay,
+                                otHourlyRate: r.rates.otHourlyRate,
+                              });
+                              setOtPaymentForm({
+                                paid_ot_hours: Number(row.paidRecord.paid_ot_hours || 0),
+                                paid_ot_amount: Number(row.paidRecord.paid_ot_amount || 0),
+                                notes: row.paidRecord.notes || '',
+                              });
+                            }}
+                            className="mt-1 text-[10px] font-black uppercase text-[#FF6600] hover:underline"
+                          >
+                            ✎ Record OT Payout
+                          </button>
+                        </td>
+                        <td className="py-4 font-mono">
+                          <strong
+                            className={
+                              row.unpaidOtAmount > 0 ? 'text-[#FF6600]' : 'text-slate-400'
+                            }
+                          >
+                            {row.unpaidOtHours}h (Rs. {row.unpaidOtAmount.toLocaleString()})
+                          </strong>
+                        </td>
+                        <td className="py-4 pr-2 text-right font-mono">
+                          <strong className="text-base font-black text-black block">
+                            Rs. {r.netPayout.toLocaleString()}
+                          </strong>
+                          {Number(row.paidRecord.paid_ot_amount) > 0 && (
+                            <span className="text-[10px] text-slate-500 block">
+                              Rem. After OT Paid: Rs.{' '}
+                              {row.balancePayableAfterOtPaid.toLocaleString()}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
               </tbody>
             </table>
           </div>
@@ -1036,17 +1211,9 @@ export default function AdminPortal({
       {/* TAB 5: NFC CARD PAIRING */}
       {adminTab === 'cards' && (
         <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
-          <div className="flex justify-between items-center">
-            <div>
-              <h2 className="text-2xl font-black tracking-tight text-black">
-                NFC & RFID Card Enrollment
-              </h2>
-              <p className="text-xs text-slate-400 font-semibold mt-0.5">
-                Link 10-digit RFID badges to workers for 24/7 Kiosk Gate check-in
-              </p>
-            </div>
-          </div>
-
+          <h2 className="text-2xl font-black tracking-tight text-black">
+            NFC & RFID Card Enrollment
+          </h2>
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse min-w-[700px]">
               <thead>
@@ -1060,14 +1227,13 @@ export default function AdminPortal({
               </thead>
               <tbody className="divide-y divide-slate-100 text-xs font-semibold">
                 {teamMembers.map((member) => (
-                  <tr key={member.id} className="hover:bg-slate-50/70 transition-colors">
+                  <tr key={member.id} className="hover:bg-slate-50/70">
                     <td className="py-4 pl-2 font-bold text-black">{member.full_name}</td>
                     <td className="py-4 font-mono text-slate-500">{member.user_id}</td>
                     <td className="py-4 text-slate-500">{member.designations || member.role}</td>
                     <td className="py-4">
                       {member.card_id ? (
-                        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full font-mono text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                        <span className="px-3 py-1 rounded-full font-mono text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
                           {member.card_id}
                         </span>
                       ) : (
@@ -1084,7 +1250,7 @@ export default function AdminPortal({
                           setNfcStatus({ message: '', type: 'idle' });
                           setIsNfcModalOpen(true);
                         }}
-                        className="bg-black hover:bg-[#FF6600] text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all"
+                        className="bg-black hover:bg-[#FF6600] text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase"
                       >
                         {member.card_id ? 'Change Card' : 'Pair Card +'}
                       </button>
@@ -1100,7 +1266,9 @@ export default function AdminPortal({
       {/* TAB 6: CLIENT INQUIRIES */}
       {adminTab === 'leads' && (
         <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
-          <h2 className="text-2xl font-black tracking-tight text-black">Client Project Inquiries</h2>
+          <h2 className="text-2xl font-black tracking-tight text-black">
+            Client Project Inquiries
+          </h2>
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse min-w-[700px]">
               <thead>
@@ -1122,39 +1290,19 @@ export default function AdminPortal({
                         </span>
                       )}
                     </td>
-                    <td className="py-4">
-                      <span className="px-2.5 py-1 rounded-lg text-[10px] uppercase font-bold bg-slate-100 text-slate-700">
-                        {brief.service_type}
-                      </span>
-                    </td>
+                    <td className="py-4">{brief.service_type}</td>
                     <td className="py-4 text-slate-600 max-w-md">{brief.description}</td>
                     <td className="py-4 pr-2 text-right space-x-2">
                       <a
                         href={`https://wa.me/923325327333?text=Salam%20${encodeURIComponent(
                           brief.client_name
-                        )},%20regarding%20your%20${encodeURIComponent(
-                          brief.service_type
-                        )}%20inquiry%20at%20Al%20Fareed:`}
+                        )}`}
                         target="_blank"
                         rel="noreferrer"
                         className="inline-block bg-[#25D366] text-white px-3 py-1.5 rounded-lg text-[10px] font-black uppercase"
                       >
                         WhatsApp
                       </a>
-                      <button
-                        onClick={async () => {
-                          if (!confirm('Delete this inquiry?')) return;
-                          await fetch('/api/projects/delete', {
-                            method: 'DELETE',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ id: brief.id }),
-                          });
-                          onRefresh();
-                        }}
-                        className="px-2.5 py-1.5 bg-red-50 text-red-600 rounded-lg text-[10px] font-black uppercase"
-                      >
-                        Delete
-                      </button>
                     </td>
                   </tr>
                 ))}
@@ -1170,31 +1318,20 @@ export default function AdminPortal({
           <h2 className="text-2xl font-black tracking-tight text-black">
             Register New Staff Member
           </h2>
-          <p className="text-xs text-slate-400 font-semibold mt-0.5">
-            Creates login credentials and initializes their shift timing & salary profile
-          </p>
-
           <form
             onSubmit={async (e) => {
               e.preventDefault();
               const formData = new FormData(e.currentTarget);
               const payload = Object.fromEntries(formData);
-              try {
-                const res = await fetch('/api/users/register', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(payload),
-                });
-                const data = await res.json();
-                if (res.ok) {
-                  alert('Team member registered successfully!');
-                  (e.target as HTMLFormElement).reset();
-                  onRefresh();
-                } else {
-                  alert(data.error || 'Registration failed');
-                }
-              } catch {
-                alert('Connection error');
+              const res = await fetch('/api/users/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+              });
+              if (res.ok) {
+                alert('Registered successfully!');
+                (e.target as HTMLFormElement).reset();
+                onRefresh();
               }
             }}
             className="space-y-4 mt-6 text-xs"
@@ -1207,8 +1344,8 @@ export default function AdminPortal({
                 <input
                   name="full_name"
                   required
-                  placeholder="e.g. Chachu Abdullah"
-                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none focus:border-[#FF6600]"
+                  placeholder="e.g. Abdullah"
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold"
                 />
               </div>
               <div>
@@ -1219,11 +1356,10 @@ export default function AdminPortal({
                   name="user_id"
                   required
                   placeholder="e.g. 3086049240"
-                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold outline-none focus:border-[#FF6600]"
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                 />
               </div>
             </div>
-
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div>
                 <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
@@ -1233,8 +1369,7 @@ export default function AdminPortal({
                   name="password"
                   type="password"
                   required
-                  placeholder="Pass-key"
-                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none focus:border-[#FF6600]"
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold"
                 />
               </div>
               <div>
@@ -1243,8 +1378,8 @@ export default function AdminPortal({
                 </label>
                 <input
                   name="designations"
-                  placeholder="e.g. Computer Operator"
-                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none focus:border-[#FF6600]"
+                  placeholder="Computer Operator"
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold"
                 />
               </div>
               <div>
@@ -1253,67 +1388,16 @@ export default function AdminPortal({
                 </label>
                 <select
                   name="role"
-                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none focus:border-[#FF6600]"
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold"
                 >
                   <option value="worker">Worker</option>
                   <option value="admin">Administrator</option>
                 </select>
               </div>
             </div>
-
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pt-2 border-t border-slate-100">
-              <div>
-                <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
-                  Pay Basis
-                </label>
-                <select
-                  name="pay_type"
-                  className="w-full px-3 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold"
-                >
-                  <option value="monthly">Monthly</option>
-                  <option value="weekly">Weekly</option>
-                  <option value="daily">Daily</option>
-                  <option value="hourly">Hourly</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
-                  Base Salary (PKR)
-                </label>
-                <input
-                  name="base_rate"
-                  type="number"
-                  defaultValue={35000}
-                  className="w-full px-3 py-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
-                />
-              </div>
-              <div>
-                <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
-                  Shift Start
-                </label>
-                <input
-                  name="shift_start"
-                  type="time"
-                  defaultValue="09:00"
-                  className="w-full px-3 py-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
-                />
-              </div>
-              <div>
-                <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
-                  Shift End
-                </label>
-                <input
-                  name="shift_end"
-                  type="time"
-                  defaultValue="21:00"
-                  className="w-full px-3 py-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
-                />
-              </div>
-            </div>
-
             <button
               type="submit"
-              className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest transition-all"
+              className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest"
             >
               Create Staff Account +
             </button>
@@ -1321,7 +1405,7 @@ export default function AdminPortal({
         </div>
       )}
 
-      {/* MODAL 1: CONFIGURE SHIFT & MULTI-BASIS WAGES */}
+      {/* MODAL 1: CONFIGURE SHIFT & 26 / 28 / 30 WORKING DAYS */}
       {editingWageWorker && (
         <div className="fixed inset-0 z-[7500] flex items-center justify-center bg-black/75 backdrop-blur-md p-4">
           <div className="bg-white rounded-3xl max-w-xl w-full p-8 shadow-2xl relative border border-slate-200 max-h-[92vh] overflow-y-auto">
@@ -1332,15 +1416,55 @@ export default function AdminPortal({
               ✕
             </button>
             <h3 className="text-xl font-black text-black">
-              Configure Shift Timing & Salary Basis
+              Configure Shift Timing, Working Days & Salary
             </h3>
             <p className="text-xs text-slate-400 font-semibold mt-1">
-              Staff Member: <strong className="text-black">{editingWageWorker.full_name}</strong> (#
-              {editingWageWorker.user_id})
+              Staff Member: <strong className="text-black">{editingWageWorker.full_name}</strong>
             </p>
 
             <form onSubmit={handleSaveWageConfig} className="space-y-4 mt-6 text-xs">
-              {/* Pay Basis Selector */}
+              {/* Working Days Preset Buttons (26d, 28d, 30d) */}
+              <div>
+                <label className="block text-[10px] font-black uppercase text-slate-400 mb-2">
+                  Monthly Working Days & Sunday Rule
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    {
+                      days: 26,
+                      title: '26 Days (4 Sun Off)',
+                      desc: '0 Sun in expected; all 4 Sun for OT/Cover',
+                    },
+                    {
+                      days: 28,
+                      title: '28 Days (2 Sun Reg)',
+                      desc: '2 Sun regular + 2 Sun for OT/Cover',
+                    },
+                    {
+                      days: 30,
+                      title: '30 Days (All Sun Reg)',
+                      desc: 'All Sundays counted in regular month',
+                    },
+                  ].map((preset) => (
+                    <button
+                      type="button"
+                      key={preset.days}
+                      onClick={() =>
+                        setWageForm({ ...wageForm, working_days_month: preset.days })
+                      }
+                      className={`p-3 rounded-2xl border text-left transition-all ${
+                        wageForm.working_days_month === preset.days
+                          ? 'bg-orange-50 border-[#FF6600] text-black'
+                          : 'bg-slate-50 border-slate-200 text-slate-600'
+                      }`}
+                    >
+                      <span className="font-black block text-xs">{preset.title}</span>
+                      <span className="text-[9px] text-slate-500 block mt-0.5">{preset.desc}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
@@ -1351,7 +1475,7 @@ export default function AdminPortal({
                     onChange={(e) =>
                       setWageForm({ ...wageForm, pay_type: e.target.value as PayBasis })
                     }
-                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none focus:border-[#FF6600]"
+                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-bold"
                   >
                     <option value="monthly">Monthly Fixed Base</option>
                     <option value="weekly">Weekly Base</option>
@@ -1371,16 +1495,15 @@ export default function AdminPortal({
                     onChange={(e) =>
                       setWageForm({ ...wageForm, base_rate: Number(e.target.value) })
                     }
-                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold outline-none focus:border-[#FF6600]"
+                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                   />
                 </div>
               </div>
 
-              {/* Scheduled Shift Start & End */}
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
-                    Shift Start Time (e.g. 09:00)
+                    Shift Start Time
                   </label>
                   <input
                     type="time"
@@ -1391,7 +1514,7 @@ export default function AdminPortal({
                 </div>
                 <div>
                   <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
-                    Shift End Time (Supports Midnight 00:00)
+                    Shift End Time
                   </label>
                   <input
                     type="time"
@@ -1402,8 +1525,7 @@ export default function AdminPortal({
                 </div>
               </div>
 
-              {/* Working Days & Multipliers */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="grid grid-cols-3 gap-3">
                 <div>
                   <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
                     Days / Month
@@ -1413,19 +1535,6 @@ export default function AdminPortal({
                     value={wageForm.working_days_month}
                     onChange={(e) =>
                       setWageForm({ ...wageForm, working_days_month: Number(e.target.value) })
-                    }
-                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
-                    Days / Week
-                  </label>
-                  <input
-                    type="number"
-                    value={wageForm.working_days_week}
-                    onChange={(e) =>
-                      setWageForm({ ...wageForm, working_days_week: Number(e.target.value) })
                     }
                     className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
                   />
@@ -1459,14 +1568,13 @@ export default function AdminPortal({
                 </div>
               </div>
 
-              {/* Automatic Real-Time Breakdown Box */}
               <div className="bg-black text-white p-5 rounded-2xl space-y-3 font-mono text-xs">
                 <div className="flex justify-between items-center border-b border-white/10 pb-2">
                   <span className="text-[10px] font-sans font-black uppercase tracking-widest text-[#FF6600]">
-                    Auto-Calculated Rate Breakdown
+                    Auto-Converted Salary Breakdown
                   </span>
                   <span className="text-slate-400">
-                    Shift Length: <strong className="text-white">{modalConvertedPreview.shiftDurationHours} hrs</strong>
+                    Shift: <strong className="text-white">{modalConvertedPreview.shiftDurationHours}h</strong>
                   </span>
                 </div>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -1495,30 +1603,101 @@ export default function AdminPortal({
                     </strong>
                   </div>
                 </div>
-                <div className="flex justify-between text-[11px] text-slate-300 pt-2 border-t border-white/10">
-                  <span>
-                    Overtime Rate ({wageForm.ot_multiplier}x):{' '}
-                    <strong className="text-[#FF6600]">Rs. {modalConvertedPreview.otHourlyRate}/hr</strong>
-                  </span>
-                  <span>
-                    Late Penalty: <strong className="text-red-400">Rs. {modalConvertedPreview.minuteRate}/min</strong>
-                  </span>
-                </div>
               </div>
 
               <button
                 type="submit"
                 disabled={isSavingWage}
-                className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest transition-all"
+                className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest"
               >
-                {isSavingWage ? 'Saving to Database...' : 'Save Shift & Wage Configuration'}
+                {isSavingWage ? 'Saving...' : 'Save Configuration'}
               </button>
             </form>
           </div>
         </div>
       )}
 
-      {/* MODAL 2: MANUAL ADD / EDIT SHIFT PUNCH */}
+      {/* MODAL 2: RECORD PAID OVERTIME HOURS & AMOUNT */}
+      {editingOtWorker && (
+        <div className="fixed inset-0 z-[7500] flex items-center justify-center bg-black/75 backdrop-blur-md p-4">
+          <div className="bg-white rounded-3xl max-w-md w-full p-8 shadow-2xl relative border border-slate-200">
+            <button
+              onClick={() => setEditingOtWorker(null)}
+              className="absolute top-6 right-6 text-slate-400 hover:text-black font-bold text-lg"
+            >
+              ✕
+            </button>
+            <h3 className="text-xl font-black text-black">Record Paid Overtime</h3>
+            <p className="text-xs text-slate-400 font-semibold mt-1">
+              Worker: <strong className="text-black">{editingOtWorker.member.full_name}</strong> •
+              Total Earned OT: <strong>{editingOtWorker.totalOtHours}h</strong> (Rs.{' '}
+              {editingOtWorker.totalOtEarned.toLocaleString()})
+            </p>
+
+            <form onSubmit={handleSaveOtPayment} className="space-y-4 mt-6 text-xs">
+              <div>
+                <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
+                  Overtime Hours Paid
+                </label>
+                <input
+                  type="number"
+                  step="0.1"
+                  value={otPaymentForm.paid_ot_hours}
+                  onChange={(e) => {
+                    const hrs = Number(e.target.value);
+                    setOtPaymentForm({
+                      ...otPaymentForm,
+                      paid_ot_hours: hrs,
+                      paid_ot_amount: Math.round(hrs * editingOtWorker.otHourlyRate),
+                    });
+                  }}
+                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
+                  Overtime Amount Paid (PKR)
+                </label>
+                <input
+                  type="number"
+                  value={otPaymentForm.paid_ot_amount}
+                  onChange={(e) =>
+                    setOtPaymentForm({ ...otPaymentForm, paid_ot_amount: Number(e.target.value) })
+                  }
+                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
+                />
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setOtPaymentForm({
+                      ...otPaymentForm,
+                      paid_ot_hours: editingOtWorker.totalOtHours,
+                      paid_ot_amount: editingOtWorker.totalOtEarned,
+                    })
+                  }
+                  className="w-full py-2.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-xl font-black text-[10px] uppercase"
+                >
+                  Mark 100% OT as Paid ({editingOtWorker.totalOtHours}h = Rs.{' '}
+                  {editingOtWorker.totalOtEarned})
+                </button>
+              </div>
+
+              <button
+                type="submit"
+                className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest"
+              >
+                Save OT Payment Status
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 3: MANUAL ADD / EDIT SHIFT PUNCH */}
       {isManualModalOpen && (
         <div className="fixed inset-0 z-[7500] flex items-center justify-center bg-black/75 backdrop-blur-md p-4">
           <div className="bg-white rounded-3xl max-w-lg w-full p-8 shadow-2xl relative border border-slate-200">
@@ -1531,11 +1710,6 @@ export default function AdminPortal({
             <h3 className="text-xl font-black text-black">
               {manualForm.record_id ? 'Adjust Shift Timing' : 'Manual Shift Entry'}
             </h3>
-            <p className="text-xs text-slate-400 font-semibold mt-1">
-              If Tap Out is earlier than Tap In (e.g. 09:00:00 to 01:30:00), it automatically
-              calculates as a cross-midnight shift.
-            </p>
-
             <form onSubmit={handleSaveManualRecord} className="space-y-4 mt-6 text-xs">
               <div>
                 <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
@@ -1555,7 +1729,7 @@ export default function AdminPortal({
               </div>
               <div>
                 <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
-                  Shift Start Date
+                  Shift Date
                 </label>
                 <input
                   type="date"
@@ -1571,7 +1745,6 @@ export default function AdminPortal({
                   </label>
                   <input
                     type="text"
-                    placeholder="09:00:00"
                     value={manualForm.clock_in}
                     onChange={(e) => setManualForm({ ...manualForm, clock_in: e.target.value })}
                     className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
@@ -1579,11 +1752,10 @@ export default function AdminPortal({
                 </div>
                 <div>
                   <label className="block text-[10px] font-black uppercase text-slate-400 mb-1">
-                    Tap Out (Leave empty if Active)
+                    Tap Out
                   </label>
                   <input
                     type="text"
-                    placeholder="01:30:00"
                     value={manualForm.clock_out}
                     onChange={(e) => setManualForm({ ...manualForm, clock_out: e.target.value })}
                     className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold"
@@ -1592,7 +1764,7 @@ export default function AdminPortal({
               </div>
               <button
                 type="submit"
-                className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest transition-all"
+                className="w-full bg-[#FF6600] hover:bg-black text-white font-black py-4 rounded-xl text-xs uppercase tracking-widest"
               >
                 Save Shift Record
               </button>
@@ -1601,7 +1773,7 @@ export default function AdminPortal({
         </div>
       )}
 
-      {/* MODAL 3: NFC CARD PAIRING */}
+      {/* MODAL 4: NFC CARD PAIRING */}
       {isNfcModalOpen && selectedCardWorker && (
         <div className="fixed inset-0 z-[7500] flex items-center justify-center bg-black/75 backdrop-blur-md p-4">
           <div className="bg-white rounded-3xl max-w-md w-full p-8 shadow-2xl relative border border-slate-200">
@@ -1614,16 +1786,9 @@ export default function AdminPortal({
             >
               ✕
             </button>
-            <div className="text-center mb-6">
-              <h3 className="text-xl font-black text-black">Pair NFC / RFID Card</h3>
-              <p className="text-xs text-slate-400 font-semibold mt-1">
-                Employee: <strong className="text-black">{selectedCardWorker.full_name}</strong>
-              </p>
-            </div>
-            <div className="bg-slate-50 border-2 border-dashed border-slate-200 rounded-2xl p-6 text-center mb-6">
-              <p className="text-xs font-bold text-slate-700">Tap Card on USB Reader Now</p>
-              <p className="text-[11px] text-slate-400 mt-1">Or type the 10-digit UID below</p>
-            </div>
+            <h3 className="text-xl font-black text-black text-center mb-4">
+              Pair Card: {selectedCardWorker.full_name}
+            </h3>
             {nfcStatus.message && (
               <div className="p-3 rounded-xl text-xs font-bold text-center mb-4 bg-orange-50 text-[#FF6600]">
                 {nfcStatus.message}
@@ -1641,12 +1806,9 @@ export default function AdminPortal({
                     cardId: nfcInput.trim(),
                   }),
                 });
-                const data = await res.json();
                 if (res.ok) {
                   onRefresh();
                   setIsNfcModalOpen(false);
-                } else {
-                  setNfcStatus({ message: data.error || 'Error', type: 'error' });
                 }
               }}
               className="space-y-4"
@@ -1655,37 +1817,15 @@ export default function AdminPortal({
                 type="text"
                 value={nfcInput}
                 onChange={(e) => setNfcInput(e.target.value)}
-                placeholder="e.g. 0170112260"
+                placeholder="10-Digit Card UID"
                 className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-mono text-sm font-bold text-center"
               />
-              <div className="flex gap-2">
-                <button
-                  type="submit"
-                  className="flex-1 bg-[#FF6600] hover:bg-black text-white py-3 rounded-xl font-black text-xs uppercase"
-                >
-                  Save Card
-                </button>
-                {selectedCardWorker.card_id && (
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      await fetch('/api/users/assign-card', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          userId: selectedCardWorker.user_id,
-                          cardId: null,
-                        }),
-                      });
-                      onRefresh();
-                      setIsNfcModalOpen(false);
-                    }}
-                    className="px-4 py-3 bg-red-50 text-red-600 rounded-xl font-black text-xs uppercase"
-                  >
-                    Unpair
-                  </button>
-                )}
-              </div>
+              <button
+                type="submit"
+                className="w-full bg-[#FF6600] hover:bg-black text-white py-3 rounded-xl font-black text-xs uppercase"
+              >
+                Save Card
+              </button>
             </form>
           </div>
         </div>

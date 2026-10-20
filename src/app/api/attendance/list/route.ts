@@ -1,9 +1,24 @@
-// app/api/attendance/list/route.ts
+// src/app/api/attendance/list/route.ts
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 
+async function ensureSundayColumns() {
+  try {
+    await db.execute(
+      `ALTER TABLE attendance ADD COLUMN sunday_mode VARCHAR(30) DEFAULT 'AUTO_SPLIT'`
+    );
+  } catch {}
+  try {
+    await db.execute(
+      `ALTER TABLE attendance ADD COLUMN sunday_coverage_hours DECIMAL(6,2) DEFAULT 0.00`
+    );
+  } catch {}
+}
+
 export async function GET() {
   try {
+    await ensureSundayColumns();
+
     const [rows]: any = await db.execute(`
       SELECT 
         a.id,
@@ -17,6 +32,8 @@ export async function GET() {
         a.status,
         a.regular_hours,
         a.overtime_hours,
+        a.sunday_mode,
+        a.sunday_coverage_hours,
         a.created_at,
         u.full_name AS worker_name,
         u.designations
@@ -54,6 +71,8 @@ export async function GET() {
         status: row.status || (row.clock_out ? 'Completed' : 'Active'),
         regular_hours: parseFloat(String(row.regular_hours || 0)),
         overtime_hours: parseFloat(String(row.overtime_hours || 0)),
+        sunday_mode: row.sunday_mode || 'AUTO_SPLIT',
+        sunday_coverage_hours: parseFloat(String(row.sunday_coverage_hours || 0)),
         created_at: row.created_at || null,
       };
     });
